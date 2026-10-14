@@ -139,12 +139,44 @@ func MakePlan(dir string, minFrames int64) (*Plan, *take.Manifest, error) {
 		p.UncertaintyFrames = max(p.UncertaintyFrames, e.UncertaintyFrames)
 		tevs = append(tevs, te)
 	}
-	tevs = append(tevs, reanchorDropouts(tevs, clog, m.LatencyFrames, p)...)
+	if clog.SelfFilling {
+		tevs = append(tevs, excludeFilled(tevs, clog, m.LatencyFrames, p)...)
+	} else {
+		tevs = append(tevs, reanchorDropouts(tevs, clog, m.LatencyFrames, p)...)
+	}
 	p.Segments, err = timeline.Segments(tevs, p.MasterFrames, m.LatencyFrames, minFrames)
 	if err != nil {
 		return nil, nil, err
 	}
 	return p, m, nil
+}
+
+// excludeFilled keeps silence that a capture source inserted for lost
+// input out of the deliverables: placement stays linear across a filled
+// gap, so the run is cut at the gap and resumed after it, leaving a
+// visible hole on the timeline instead of silent audio inside a clip.
+func excludeFilled(evs []timeline.Event, clog *timeline.CaptureLog, latency int64, p *Plan) []timeline.Event {
+	var out []timeline.Event
+	for _, b := range clog.Blocks {
+		if !b.Filled {
+			continue
+		}
+		p.Warnings = append(p.Warnings, fmt.Sprintf("%d frames of lost input at master frame %d were filled with silence and left out of the deliverables", b.Samples, b.Frame))
+		start, end := b.Frame-latency, b.Frame+b.Samples-latency
+		var cur *timeline.Event
+		for i := range evs {
+			if evs[i].Frame <= start && (cur == nil || evs[i].Frame >= cur.Frame) {
+				cur = &evs[i]
+			}
+		}
+		if cur == nil || !cur.Rolling {
+			continue
+		}
+		out = append(out,
+			timeline.Event{Frame: start, Rolling: false},
+			timeline.Event{Frame: end, Rolling: true, TimelineSample: cur.TimelineSample + (end - cur.Frame)})
+	}
+	return out
 }
 
 // reanchorDropouts handles input dropouts: if the capture clock jumped

@@ -12,10 +12,12 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
 	"antimusic.dev/remotesession/internal/deliver"
+	"antimusic.dev/remotesession/internal/link"
 	"antimusic.dev/remotesession/internal/ptsl"
 	"antimusic.dev/remotesession/internal/recorder"
 	"antimusic.dev/remotesession/internal/take"
@@ -29,6 +31,7 @@ commands:
   devices        list CoreAudio input devices
   record         record a lossless master, journaling DAW transport
   deliver        render placed BWF deliverables from a take and verify them
+  links          list RemoteSession Link plugin instances
   ptsl-status    show Pro Tools session and transport via PTSL
   ptsl-import    import a take's deliverables into Pro Tools at their positions
 `
@@ -46,6 +49,8 @@ func main() {
 		err = record(args)
 	case "deliver":
 		err = deliverCmd(args)
+	case "links":
+		err = links()
 	case "ptsl-status":
 		err = ptslStatus(args)
 	case "ptsl-import":
@@ -69,6 +74,7 @@ func devices() error {
 func record(args []string) error {
 	fs := flag.NewFlagSet("record", flag.ExitOnError)
 	device := fs.String("device", "", "CoreAudio input device name or UID (see rsession devices)")
+	linkSel := fs.String("link", "", "record a RemoteSession Link plugin instance (track name or .rslink path) with exact transport stamps")
 	dir := fs.String("dir", "", "take directory to create")
 	latency := fs.Int64("latency", 0, "capture-path latency in frames (measured)")
 	codec := fs.String("codec", "pcm_f32le", "master codec: pcm_f32le (bit-exact device float) or pcm_s24le")
@@ -79,8 +85,8 @@ func record(args []string) error {
 	start := fs.String("session-start", "00:00:00:00", "session start timecode (without -ptsl)")
 	fps := fs.String("fps", "25", "timecode rate for -session-start: 23.976 24 25 29.97 29.97df 30 50 59.94 59.94df 60")
 	fs.Parse(args)
-	if *device == "" || *dir == "" {
-		return errors.New("record: -device and -dir are required")
+	if (*device == "") == (*linkSel == "") || *dir == "" {
+		return errors.New("record: -dir and exactly one of -device or -link are required")
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -108,6 +114,9 @@ func record(args []string) error {
 		sess = &take.Session{Source: "manual", SampleRate: *rate, StartTimecode: *start, StartSample: n}
 	}
 
+	if *linkSel != "" {
+		return recordLink(ctx, *linkSel, *dir, *codec, sess)
+	}
 	r, err := recorder.Start(recorder.Config{
 		Dir: *dir, Device: *device,
 		MasterCodec: *codec, LatencyFrames: *latency, Session: sess,
@@ -295,4 +304,77 @@ func siblingTool(name string) string {
 		}
 	}
 	return name
+}
+
+func links() error {
+	infos, err := link.List(link.Dir())
+	if err != nil {
+		return err
+	}
+	for _, i := range infos {
+		state := map[uint32]string{link.StateActive: "active", link.StateClosed: "closed"}[i.State]
+		if !i.Alive {
+			state = "stale"
+		}
+		fmt.Printf("%s\t%q\t%s\t%.0f Hz\t%d ch\t%s\n", state, i.TrackName, i.HostName, i.SampleRate, i.Channels, i.Path)
+	}
+	return nil
+}
+
+// recordLink records a Link plugin instance. Transport events come from
+// the plugin's per-block host positions, so placement is exact.
+func recordLink(ctx context.Context, sel, dir, codec string, sess *take.Session) error {
+	path := sel
+	if !strings.HasSuffix(sel, ".rslink") {
+		infos, err := link.List(link.Dir())
+		if err != nil {
+			return err
+		}
+		path = ""
+		for _, i := range infos {
+			if i.Alive && i.State == link.StateActive && i.TrackName == sel {
+				path = i.Path // newest instance wins
+			}
+		}
+		if path == "" {
+			return fmt.Errorf("no active Link instance on a track named %q (see rsession links)", sel)
+		}
+	}
+	ring, err := link.Open(path)
+	if err != nil {
+		return err
+	}
+	defer ring.Close()
+	if sess == nil {
+		return errors.New("record -link needs session details (-ptsl, or -session-rate/-session-start)")
+	}
+	if float64(sess.SampleRate) != ring.SampleRate {
+		return fmt.Errorf("Link runs at %.0f Hz but the session is %d Hz", ring.SampleRate, sess.SampleRate)
+	}
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		return err
+	}
+	r, err := recorder.Start(recorder.Config{Dir: dir, Stream: pr, StreamRate: int(ring.SampleRate),
+		StreamChannels: ring.Channels, StreamName: ring.TrackName, MasterCodec: codec, Session: sess})
+	pr.Close()
+	if err != nil {
+		return err
+	}
+	clog, err := os.Create(filepath.Join(dir, take.CaptureLog))
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "recording Link %q (%s) -> %s (Ctrl-C to stop)\n", ring.TrackName, ring.HostName, dir)
+	pump := &link.Pump{Reader: ring.NewReader(true), PCM: pw, Log: clog, Events: r.Events}
+	perr := pump.Run(ctx)
+	clog.Close()
+	pw.Close()
+	werr := r.Wait()
+	fmt.Fprintf(os.Stderr, "take %s: %d frames, %d transport events, %d frames lost and filled\n",
+		dir, pump.Stats.Frames, pump.Stats.Events, pump.Stats.FilledFrames)
+	if perr != nil {
+		return perr
+	}
+	return werr
 }

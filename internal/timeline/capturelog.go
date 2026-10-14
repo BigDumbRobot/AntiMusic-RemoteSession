@@ -28,6 +28,7 @@ type CaptureBlock struct {
 	Frame      int64 // master frame of the block's first sample
 	Samples    int64 // frames in the block
 	HostMicros int64 // capture host time (mach_absolute_time) in µs
+	Filled     bool  // silence standing in for lost input
 }
 
 // CaptureLog is the capture clock of a master: which host time each
@@ -35,6 +36,13 @@ type CaptureBlock struct {
 type CaptureLog struct {
 	SampleRate int
 	Blocks     []CaptureBlock
+	// SelfFilling is set when the log came from a source that detects its
+	// own gaps exactly, fills them, and marks the lines (7th field):
+	// rs-capture (device sample clock) and the Link plugin stream. Host
+	// times in such logs are informational and must not be used to infer
+	// dropouts (a host's process-call times jitter).
+	SelfFilling  bool
+	FilledFrames int64
 }
 
 // Discontinuity is a place where host time advanced by more than the
@@ -100,7 +108,14 @@ func ParseCaptureLog(r io.Reader, sampleRate int) (*CaptureLog, error) {
 		}
 		us := new(big.Int).Mul(big.NewInt(pts), big.NewInt(1_000_000*num))
 		us.Quo(us, big.NewInt(den))
-		cl.Blocks = append(cl.Blocks, CaptureBlock{Frame: v[0], Samples: v[1], HostMicros: us.Int64()})
+		if len(fs) >= 7 {
+			cl.SelfFilling = true
+		}
+		filled := len(fs) >= 7 && fs[6] == "1"
+		if filled {
+			cl.FilledFrames += v[1]
+		}
+		cl.Blocks = append(cl.Blocks, CaptureBlock{Frame: v[0], Samples: v[1], HostMicros: us.Int64(), Filled: filled})
 	}
 	return cl, sc.Err()
 }

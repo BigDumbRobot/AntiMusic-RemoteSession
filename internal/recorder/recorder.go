@@ -44,6 +44,14 @@ type Config struct {
 	CaptureHelper string
 	// CaptureArgs are extra rs-capture arguments (test rigs: --play).
 	CaptureArgs []string
+	// Stream supplies raw interleaved float32 PCM (e.g. from the Link
+	// plugin) at StreamRate/StreamChannels. The caller writes capture.log,
+	// keeps ownership of Stream, and ends the take by ending the stream
+	// (then Wait).
+	Stream         io.Reader
+	StreamRate     int
+	StreamChannels int
+	StreamName     string
 	// Input holds FFmpeg input options ending with "-i <source>".
 	Input []string
 	// MasterCodec defaults to pcm_f32le, which stores the device's
@@ -71,8 +79,14 @@ type Recorder struct {
 
 // Start creates the take directory and starts capturing.
 func Start(cfg Config) (*Recorder, error) {
-	if (cfg.Device == "") == (len(cfg.Input) == 0) {
-		return nil, errors.New("recorder: set exactly one of Device or Input")
+	sources := 0
+	for _, set := range []bool{cfg.Device != "", len(cfg.Input) > 0, cfg.Stream != nil} {
+		if set {
+			sources++
+		}
+	}
+	if sources != 1 {
+		return nil, errors.New("recorder: set exactly one of Device, Input or Stream")
 	}
 	if cfg.MasterCodec == "" {
 		cfg.MasterCodec = "pcm_f32le"
@@ -113,6 +127,11 @@ func Start(cfg Config) (*Recorder, error) {
 		r.manifest.Input = []string{"rs-capture", hdr.Name, hdr.UID}
 		r.manifest.SampleRate, r.manifest.Channels = hdr.Rate, hdr.Channels
 		args = append(args, "-f", "f32le", "-ar", strconv.Itoa(hdr.Rate), "-ac", strconv.Itoa(hdr.Channels), "-i", "pipe:0")
+	} else if cfg.Stream != nil {
+		stdin = cfg.Stream
+		r.manifest.Input = []string{"stream", cfg.StreamName}
+		r.manifest.SampleRate, r.manifest.Channels = cfg.StreamRate, cfg.StreamChannels
+		args = append(args, "-f", "f32le", "-ar", strconv.Itoa(cfg.StreamRate), "-ac", strconv.Itoa(cfg.StreamChannels), "-i", "pipe:0")
 	} else {
 		r.manifest.Input = cfg.Input
 		args = append(args, "-copyts")
@@ -138,8 +157,8 @@ func Start(cfg Config) (*Recorder, error) {
 		r.Events.Close()
 		return nil, err
 	}
-	if c, ok := stdin.(io.Closer); ok {
-		c.Close() // FFmpeg holds its own copy of the pipe
+	if c, ok := stdin.(io.Closer); ok && r.capture != nil {
+		c.Close() // FFmpeg holds its own copy of the capture pipe
 	}
 	go r.wait()
 	return r, nil
