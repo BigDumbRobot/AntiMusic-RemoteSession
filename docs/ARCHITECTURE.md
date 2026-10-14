@@ -11,7 +11,7 @@ decision cites a measurement made on the development machine. Statements marked
 | OS | macOS 26.1 (25B78), Apple Silicon (arm64) |
 | DAW | Pro Tools 26.4.0 build 175 ("2026.4"), Intel binary running under Rosetta |
 | DAW scripting | PTSL, gRPC on `localhost:31416`; the schema is embedded in `Pro Tools.app/Contents/Frameworks/libPTSL.dylib` (proto3, self-contained). The PTSL C++ SDK zip in Dropbox is a 0-byte online-only placeholder. |
-| Plugin SDKs | No AAX SDK on disk. JUCE 6.0.8 exists inside `~/sonobus` (third-party project, not used). |
+| Plugin SDKs | JUCE 8.0.10 (as used by Anti-Music's Panner) bundles the AAX SDK. No PACE signing tools and no Pro Tools Developer build. |
 | FFmpeg | 9.0.1 (Homebrew): `avfoundation` input, `audiotoolbox` output, WAV muxer with `write_bext` and `rf64`, CAF muxer |
 | Toolchain | Go 1.25, Apple clang 21, Swift, CMake, Python 3.14 |
 | Audio devices | Pro Tools Audio Bridge 2-A/2-B/6/16/32/64, VB-Cable (8 ch, 44.1 kHz), built-in microphone and others |
@@ -174,15 +174,59 @@ Code that converts between these is the only place they meet:
   translates gaps from master frames to transport frames (a bug caught by
   `TestDropoutIsReanchored`).
 
+### 6. Plugin post-processing prints (`rs-render`, `deliver -chain`)
+
+The receiving end prints a take's lossless master through a chain of
+AU/VST3 plugins offline. It never prints from the live stream.
+
+- `rs-render` is a JUCE 8 host. It runs the chain non-realtime, and plugins see
+  the segment's real timeline position.
+- The chain's reported latency is removed, so output frame *i* answers input
+  frame *i*. An optional decay tail is kept.
+- The print gets the same `bext` TimeReference as the dry file.
+
+Evidence:
+
+- AUPeakLimiter reports 96 samples of lookahead. After compensation, its print
+  of a below-threshold signal equals the dry timeline signal sample for sample.
+- Plugins can misreport latency, so every print is cross-correlated against the
+  dry signal. A renderer hiding a 37-frame delay was rejected with "37 frames
+  off the dry signal".
+- Fully wet prints (correlation < 0.5) cannot be checked this way and are
+  reported as relying on reported latency.
+
+### 7. RemoteSession Link plugin (AAX/AU/VST3) for exact transport
+
+Link is a zero-latency pass-through insert. Per block, it publishes the
+track's audio together with the host's timeline position and play/record
+flags, through a memory-mapped ring (`native/link/LinkShared.h`).
+
+- The writer never waits.
+- The reader detects overruns from monotonic counters. Lost blocks are filled
+  with marked silence, then cut out of deliverables as a visible gap.
+- `rsession record -link` turns the stream into a take whose transport events
+  carry exact master frames, replacing PTSL polling.
+- It is built as a universal binary because Pro Tools 2026.4 runs under Rosetta.
+
+Evidence:
+
+- The built VST3, hosted by `rs-render`, was a bit-exact pass-through.
+- It published 282 blocks with every sample stamped with its timeline position.
+- A scripted take with start, stop, locate, a loop jump, and a 36-block
+  overrun delivered sample-exact placements.
+
+**Unverified:** whether the position Pro Tools reports to an AAX insert accounts
+for delay compensation upstream of the insert. This needs the plugin running
+in Pro Tools.
+
 ## Blockers and risks
 
-1. **No sample-accurate live transport anchor for Pro Tools.** PTSL is too
-   coarse (see 4). Per-buffer session positions require an AAX plugin reading
-   the host transport. The AAX SDK is not on this machine, and running in
-   retail Pro Tools requires Avid developer access and PACE signing. Needed from
-   the owner: Avid developer account, AAX SDK, and PACE/iLok signing
-   credentials (or a Pro Tools Developer build). The journal format already
-   accepts exact frame-stamped events (`take.Event.Frame`) from such a source.
+1. **The Link AAX is built but unsigned.** Retail Pro Tools does not load
+   unsigned AAX plugins. Needed from the owner: PACE signing tools and an iLok
+   developer account, or a Pro Tools Developer build. Once it loads, verify:
+   - position semantics under delay compensation;
+   - behaviour while stopped;
+   - track-name reporting.
 2. **Capture-path latency** (`latency_frames`) is configurable but not yet
    measured per interface. It needs a round-trip measurement with the real
    interface, and `GetSessionSystemDelayInfo` is available to help.
