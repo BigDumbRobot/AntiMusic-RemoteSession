@@ -1,0 +1,4 @@
+/bin/
+*.caf
+*.f32
+.DS_Store
