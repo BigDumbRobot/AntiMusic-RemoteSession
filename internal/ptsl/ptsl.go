@@ -11,9 +11,11 @@ package ptsl
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -29,6 +31,13 @@ const method = "/ptsl.PTSL/SendGrpcRequest"
 type CommandID int32
 
 const (
+	CmdCreateSession          CommandID = 0
+	CmdGetTrackList           CommandID = 3
+	CmdGetClipList            CommandID = 125
+	CmdSelectAllClipsOnTrack  CommandID = 4
+	CmdCloseSession           CommandID = 17
+	CmdSetSessionStartTime    CommandID = 53
+	CmdSetTimelineSelection   CommandID = 81
 	CmdImport                 CommandID = 2
 	CmdHostReadyCheck         CommandID = 13
 	CmdGetSessionSampleRate   CommandID = 35
@@ -52,6 +61,11 @@ const (
 // Version identifies the PTSL protocol version sent in request headers.
 type Version struct{ Major, Minor, Revision int32 }
 
+// ClientVersion is the PTSL interface version this client was written
+// against (Pro Tools 2026.4). Pro Tools rejects requests without a version
+// header (SDK_VersionMismatch), including GetPTSLVersion itself.
+var ClientVersion = Version{2026, 4, 0}
+
 // Client talks to one Pro Tools instance.
 type Client struct {
 	conn    *grpc.ClientConn
@@ -67,7 +81,7 @@ func Dial(addr string) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Client{conn: conn}, nil
+	return &Client{conn: conn, version: ClientVersion}, nil
 }
 
 func (c *Client) Close() error { return c.conn.Close() }
@@ -83,10 +97,32 @@ func (e *Error) Error() string {
 	return fmt.Sprintf("ptsl: command %d failed (status %d): %s", e.Command, e.Status, e.Body)
 }
 
-// Register performs RegisterConnection and remembers the session id that
-// later requests must carry. It first asks for the PTSL version so request
-// headers match what this Pro Tools build expects.
+// Register waits for Pro Tools to report itself ready, performs
+// RegisterConnection and remembers the session id later requests carry.
+//
+// Commands must not be sent before HostReadyCheck succeeds: the PTSL port
+// opens while Pro Tools is still initializing, and Pro Tools 2026.4 was
+// observed crashing (Access Violation during UI startup) when a command
+// arrived at that moment.
 func (c *Client) Register(ctx context.Context, company, app string) error {
+	for {
+		var ready struct {
+			IsHostReady bool `json:"is_host_ready"`
+		}
+		err := c.Call(ctx, CmdHostReadyCheck, nil, &ready)
+		if err == nil && ready.IsHostReady {
+			break
+		}
+		var pe *Error
+		if err != nil && !errors.As(err, &pe) {
+			return err // not reachable at all
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("ptsl: host not ready: %w", ctx.Err())
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
 	var v struct {
 		Version         int32 `json:"version"`
 		VersionMinor    int32 `json:"version_minor"`

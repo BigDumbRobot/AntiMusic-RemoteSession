@@ -119,7 +119,7 @@ func record(args []string) error {
 
 	if client != nil {
 		w := &transport.PTSLWatcher{
-			Client: client, Log: r.Events, Interval: *poll, SampleRate: sess.SampleRate,
+			Client: client, Log: r.Events, Interval: *poll, SampleRate: sess.SampleRate, SessionStart: sess.StartSample,
 			OnError: func(err error) { fmt.Fprintln(os.Stderr, "ptsl (master unaffected):", err) },
 			OnEvent: func(e take.Event) {
 				fmt.Fprintf(os.Stderr, "transport %s at timeline %d (±%d frames)\n", e.Note, e.TimelineSample, e.UncertaintyFrames)
@@ -223,7 +223,6 @@ func ptslImport(args []string) error {
 	fs := flag.NewFlagSet("ptsl-import", flag.ExitOnError)
 	dir := fs.String("dir", "", "take directory (after deliver)")
 	addr := fs.String("ptsl-addr", ptsl.DefaultAddress, "PTSL address")
-	relative := fs.Bool("relative", false, "spot by session offset instead of absolute timeline sample")
 	fs.Parse(args)
 	if *dir == "" {
 		return errors.New("ptsl-import: -dir is required")
@@ -256,14 +255,11 @@ func ptslImport(args []string) error {
 		if err != nil {
 			return err
 		}
-		pos := d.TimeReference
-		if *relative {
-			pos = d.SessionOffset
-		}
+		pos := d.SessionOffset // PTSL positions are relative to the session start
 		if err := c.ImportSpotted(ctx, []string{abs}, audioDir, pos); err != nil {
 			return fmt.Errorf("importing %s: %w", d.File, err)
 		}
-		fmt.Printf("imported %s at %d\n", d.File, pos)
+		fmt.Printf("imported %s at session +%d samples (timeline %d)\n", d.File, pos, d.TimeReference)
 	}
 	return nil
 }

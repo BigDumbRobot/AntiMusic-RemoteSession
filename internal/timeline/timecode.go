@@ -27,16 +27,20 @@ var (
 	FPS60     = FrameRate{60, 60, 1, false}
 )
 
-// TimecodeToSamples converts "HH:MM:SS:FF" (";" before FF marks drop
-// frame) to samples since 00:00:00:00 at the given sample rate, rounding
-// to the nearest sample.
+// TimecodeToSamples converts "HH:MM:SS:FF" or "HH:MM:SS:FF.ss" (";" before
+// FF marks drop frame; ss are subframes, 1/100 frame, as Pro Tools reports
+// them) to samples since 00:00:00:00 at the given sample rate, rounding to
+// the nearest sample.
 func TimecodeToSamples(tc string, rate FrameRate, sampleRate int) (int64, error) {
 	tc = strings.TrimSpace(tc)
 	parts := strings.FieldsFunc(tc, func(r rune) bool { return r == ':' || r == ';' || r == '.' })
-	if len(parts) != 4 {
-		return 0, fmt.Errorf("timecode %q: want HH:MM:SS:FF", tc)
+	if len(parts) == 4 {
+		parts = append(parts, "0")
 	}
-	var v [4]int64
+	if len(parts) != 5 {
+		return 0, fmt.Errorf("timecode %q: want HH:MM:SS:FF[.ss]", tc)
+	}
+	var v [5]int64
 	for i, p := range parts {
 		n, err := strconv.ParseInt(p, 10, 64)
 		if err != nil || n < 0 {
@@ -44,8 +48,8 @@ func TimecodeToSamples(tc string, rate FrameRate, sampleRate int) (int64, error)
 		}
 		v[i] = n
 	}
-	h, m, s, f := v[0], v[1], v[2], v[3]
-	if m > 59 || s > 59 || f >= int64(rate.Nominal) {
+	h, m, s, f, sub := v[0], v[1], v[2], v[3], v[4]
+	if m > 59 || s > 59 || f >= int64(rate.Nominal) || sub > 99 {
 		return 0, fmt.Errorf("timecode %q out of range for %d fps", tc, rate.Nominal)
 	}
 	nom := int64(rate.Nominal)
@@ -58,10 +62,11 @@ func TimecodeToSamples(tc string, rate FrameRate, sampleRate int) (int64, error)
 		totalMin := h*60 + m
 		frames -= drop * (totalMin - totalMin/10)
 	}
-	// samples = frames * sampleRate * Den / Num, rounded half up.
-	x := new(big.Int).Mul(big.NewInt(frames), big.NewInt(int64(sampleRate)*rate.Den))
-	q, r := new(big.Int).QuoRem(x, big.NewInt(rate.Num), new(big.Int))
-	if 2*r.Int64() >= rate.Num {
+	// samples = (frames + sub/100) * sampleRate * Den / Num, rounded half up.
+	x := new(big.Int).Mul(big.NewInt(frames*100+sub), big.NewInt(int64(sampleRate)*rate.Den))
+	div := rate.Num * 100
+	q, r := new(big.Int).QuoRem(x, big.NewInt(div), new(big.Int))
+	if 2*r.Int64() >= div {
 		q.Add(q, big.NewInt(1))
 	}
 	return q.Int64(), nil

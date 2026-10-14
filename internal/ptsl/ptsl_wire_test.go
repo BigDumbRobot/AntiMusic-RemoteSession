@@ -84,7 +84,9 @@ func TestEnvelopeMatchesInstalledSchema(t *testing.T) {
 
 	// Every command id used by this package must name the intended command.
 	want := map[CommandID]string{
-		CmdImport: "CId_Import", CmdHostReadyCheck: "CId_HostReadyCheck",
+		CmdImport: "CId_Import", CmdCreateSession: "CId_CreateSession", CmdGetTrackList: "CId_GetTrackList", CmdGetClipList: "CId_GetClipList",
+		CmdSelectAllClipsOnTrack: "CId_SelectAllClipsOnTrack", CmdCloseSession: "CId_CloseSession",
+		CmdSetSessionStartTime: "CId_SetSessionStartTime", CmdSetTimelineSelection: "CId_SetTimelineSelection", CmdHostReadyCheck: "CId_HostReadyCheck",
 		CmdGetSessionSampleRate: "CId_GetSessionSampleRate", CmdGetSessionName: "CId_GetSessionName",
 		CmdGetSessionPath: "CId_GetSessionPath", CmdGetSessionStartTime: "CId_GetSessionStartTime",
 		CmdGetPTSLVersion: "CId_GetPTSLVersion", CmdGetTransportState: "CId_GetTransportState",

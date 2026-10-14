@@ -1,12 +1,12 @@
-.PHONY: all test clean
+.PHONY: all go test clean
 
-all: bin/rs-capture bin/rsession bin/loopbacktest
+all: bin/rs-capture go
 
 bin/rs-capture: native/capture/rs-capture.c
 	@mkdir -p bin
 	clang -O2 -Wall -Wextra -std=c11 -framework CoreAudio -framework CoreFoundation -o $@ $<
 
-bin/rsession bin/loopbacktest: $(shell find cmd internal -name '*.go') go.mod
+go:
 	go build -o bin/ ./cmd/...
 
 test:

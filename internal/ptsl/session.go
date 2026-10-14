@@ -108,7 +108,8 @@ func Rolling(state string) bool {
 	return s == "TransportPlaying" || s == "TransportRecording"
 }
 
-// Selection is the timeline selection in samples.
+// Selection is the timeline selection in samples relative to the session
+// start (PTSL's sample unit, verified against Pro Tools 2026.4).
 type Selection struct {
 	InSample, OutSample   int64
 	PreRollStartSample    int64
@@ -159,9 +160,8 @@ func (c *Client) SystemDelay(ctx context.Context) (samples int32, enabled bool, 
 }
 
 // ImportSpotted imports audio files onto new tracks with their start
-// spotted at a sample position given in the session's sample counter
-// units.
-func (c *Client) ImportSpotted(ctx context.Context, files []string, destDir string, sample int64) error {
+// spotted at sessionOffset samples after the session start.
+func (c *Client) ImportSpotted(ctx context.Context, files []string, destDir string, sessionOffset int64) error {
 	body := map[string]any{
 		"import_type": "Audio",
 		"audio_data": map[string]any{
@@ -173,7 +173,7 @@ func (c *Client) ImportSpotted(ctx context.Context, files []string, destDir stri
 			"location_data": map[string]any{
 				"location_type":    "Start",
 				"location_options": "Samples",
-				"location_value":   strconv.FormatInt(sample, 10),
+				"location_value":   strconv.FormatInt(sessionOffset, 10),
 			},
 		},
 	}

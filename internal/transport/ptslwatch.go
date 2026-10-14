@@ -33,6 +33,11 @@ type PTSLWatcher struct {
 	Log        *take.EventLog
 	Interval   time.Duration
 	SampleRate int
+	// SessionStart is the session start in samples since midnight. PTSL
+	// reports sample positions relative to the session start (verified
+	// against Pro Tools 2026.4); events are journaled as absolute timeline
+	// samples.
+	SessionStart int64
 	// OnError is called for each failed poll; polling continues. The
 	// master recording is unaffected by PTSL failures.
 	OnError func(error)
@@ -103,9 +108,9 @@ func (w *PTSLWatcher) logChange(ctx context.Context, rolling bool, state string,
 		// Playback starts at the selection start, or at the pre-roll
 		// start when pre-roll is enabled. (Pro Tools semantics; not yet
 		// verified against a running session.)
-		e.TimelineSample = sel.InSample
+		e.TimelineSample = w.SessionStart + sel.InSample
 		if sel.PreRollEnabled {
-			e.TimelineSample = sel.PreRollStartSample
+			e.TimelineSample = w.SessionStart + sel.PreRollStartSample
 		}
 	}
 	if err := w.Log.Append(e); err != nil {

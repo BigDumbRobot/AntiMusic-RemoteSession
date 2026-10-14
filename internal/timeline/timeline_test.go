@@ -82,6 +82,8 @@ func TestTimecodeToSamples(t *testing.T) {
 		{"01:00:00;00", FPS2997DF, 48000, 172_799_827}, // 107892 frames, 3599.9964 s, rounded
 		{"00:01:00;02", FPS2997DF, 48000, 2_882_880},   // first frame after the drop = frame 1800
 		{"10:00:00:00", FPS25, 96000, 3_456_000_000},
+		{"01:00:00:00.00", FPS25, 48000, 172_800_000}, // Pro Tools' format
+		{"00:00:00:00.50", FPS25, 48000, 960},         // half a frame
 	}
 	for _, c := range cases {
 		got, err := TimecodeToSamples(c.tc, c.rate, c.sr)
