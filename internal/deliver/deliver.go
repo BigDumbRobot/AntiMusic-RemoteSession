@@ -36,6 +36,15 @@ type Options struct {
 	MinFrames  int64
 	Originator string
 	FFmpeg     string
+
+	// Chain, if set, prints each segment through these plugins in order
+	// (post-processing). Output goes to deliver/<Label>/.
+	Chain []Plugin
+	Label string
+	// TailFrames of plugin response (decay) are kept after each segment.
+	TailFrames int64
+	// Renderer is the rs-render binary.
+	Renderer string
 }
 
 // Plan is what a take resolves to before rendering.
@@ -58,7 +67,10 @@ type Deliverable struct {
 	TimeReference int64            `json:"time_reference"`
 	// SessionOffset is the position relative to the session start.
 	SessionOffset int64   `json:"session_offset"`
-	MaxErrorLSB   float64 `json:"max_error_lsb"`
+	MaxErrorLSB   float64 `json:"max_error_lsb,omitempty"`
+	// Set for processed prints.
+	Chain     *ChainReport `json:"chain,omitempty"`
+	Alignment *Alignment   `json:"alignment,omitempty"`
 }
 
 // Report is written to deliver/delivery.json.
@@ -184,7 +196,17 @@ func Render(ctx context.Context, dir string, opts Options) (*Report, error) {
 	if err != nil {
 		return nil, err
 	}
-	out := filepath.Join(dir, take.DeliverDir)
+	rel := take.DeliverDir
+	if len(opts.Chain) > 0 {
+		if opts.Label == "" {
+			opts.Label = "processed"
+		}
+		if opts.Renderer == "" {
+			opts.Renderer = "rs-render"
+		}
+		rel = filepath.Join(rel, opts.Label)
+	}
+	out := filepath.Join(dir, rel)
 	if err := os.MkdirAll(out, 0o755); err != nil {
 		return nil, err
 	}
@@ -194,33 +216,67 @@ func Render(ctx context.Context, dir string, opts Options) (*Report, error) {
 		name := fmt.Sprintf("%s_%03d.wav", filepath.Base(filepath.Clean(dir)), i+1)
 		path := filepath.Join(out, name)
 		tref := seg.TimelineStart
-		args := []string{"-hide_banner", "-nostdin", "-loglevel", "error", "-y",
-			"-i", filepath.Join(dir, take.MasterFile),
-			"-af", fmt.Sprintf("atrim=start_sample=%d:end_sample=%d", seg.MasterStart, seg.MasterStart+seg.Frames),
-			"-c:a", opts.Codec, "-rf64", "auto", "-write_bext", "1",
+		master := filepath.Join(dir, take.MasterFile)
+		encode := []string{"-c:a", opts.Codec, "-rf64", "auto", "-write_bext", "1",
 			"-metadata", "time_reference=" + strconv.FormatInt(tref, 10),
 			"-metadata", "originator=" + opts.Originator,
 			"-metadata", fmt.Sprintf("description=master frames %d-%d", seg.MasterStart, seg.MasterStart+seg.Frames),
 			"-metadata", "origination_date=" + created.Format("2006-01-02"),
-			"-metadata", "origination_time=" + created.Format("15:04:05"),
-			path}
-		if b, err := exec.CommandContext(ctx, opts.FFmpeg, args...).CombinedOutput(); err != nil {
-			return nil, fmt.Errorf("rendering %s: %v: %s", name, err, b)
+			"-metadata", "origination_time=" + created.Format("15:04:05")}
+		d := Deliverable{File: filepath.Join(rel, name), Segment: seg, TimeReference: tref,
+			SessionOffset: tref - m.Session.StartSample}
+		if len(opts.Chain) == 0 {
+			args := append([]string{"-hide_banner", "-nostdin", "-loglevel", "error", "-y", "-i", master,
+				"-af", fmt.Sprintf("atrim=start_sample=%d:end_sample=%d", seg.MasterStart, seg.MasterStart+seg.Frames)},
+				append(encode, path)...)
+			if b, err := exec.CommandContext(ctx, opts.FFmpeg, args...).CombinedOutput(); err != nil {
+				return nil, fmt.Errorf("rendering %s: %v: %s", name, err, b)
+			}
+			if d.MaxErrorLSB, err = Verify(master, path, seg); err != nil {
+				return nil, fmt.Errorf("verifying %s: %w", name, err)
+			}
+		} else {
+			if d.Chain, err = renderChain(ctx, opts, master, seg, plan.Channels, plan.SampleRate, opts.TailFrames, encode, path); err != nil {
+				return nil, fmt.Errorf("processing %s: %w", name, err)
+			}
+			if err := verifyHeader(path, tref, seg.Frames+opts.TailFrames); err != nil {
+				return nil, fmt.Errorf("verifying %s: %w", name, err)
+			}
+			al, err := CheckAlignment(master, path, seg, 4096)
+			if err != nil {
+				return nil, fmt.Errorf("checking alignment of %s: %w", name, err)
+			}
+			d.Alignment = &al
+			if al.Checked && al.LagFrames != 0 {
+				return nil, fmt.Errorf("%s: processed audio is %d frames off the dry signal (correlation %.2f): a plugin misreports its latency",
+					name, al.LagFrames, al.Correlation)
+			}
+			if !al.Checked {
+				rep.Warnings = append(rep.Warnings, fmt.Sprintf("%s: alignment could not be checked against the dry signal (correlation %.2f); relying on reported latency %d",
+					name, al.Correlation, d.Chain.Latency))
+			}
 		}
-		maxErr, err := Verify(filepath.Join(dir, take.MasterFile), path, seg)
-		if err != nil {
-			return nil, fmt.Errorf("verifying %s: %w", name, err)
-		}
-		rep.Deliverables = append(rep.Deliverables, Deliverable{
-			File: filepath.Join(take.DeliverDir, name), Segment: seg, TimeReference: tref,
-			SessionOffset: tref - m.Session.StartSample, MaxErrorLSB: maxErr,
-		})
+		rep.Deliverables = append(rep.Deliverables, d)
 	}
 	b, err := json.MarshalIndent(rep, "", "  ")
 	if err != nil {
 		return nil, err
 	}
 	return rep, take.WriteFileAtomic(filepath.Join(out, ReportFile), append(b, '\n'))
+}
+
+func verifyHeader(path string, tref, frames int64) error {
+	info, err := wav.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	if !info.HasBext || int64(info.Bext.TimeReference) != tref {
+		return fmt.Errorf("TimeReference %d, want %d", info.Bext.TimeReference, tref)
+	}
+	if info.Frames() != frames {
+		return fmt.Errorf("%d frames, want %d", info.Frames(), frames)
+	}
+	return nil
 }
 
 // Verify checks a deliverable against the master segment it was rendered

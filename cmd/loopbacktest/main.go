@@ -205,6 +205,9 @@ func run(device string, outIndex, rate, channels int, seconds float64, lead time
 			continue
 		}
 		exact++
+		if exact == 1 {
+			fmt.Printf("signal frame 0 is at master frame %d\n", blk.Frame-start)
+		}
 		if prevSig >= 0 && start-prevSig != blk.Frame-prevMaster {
 			breaks++
 			if breaks <= 5 {

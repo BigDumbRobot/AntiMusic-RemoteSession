@@ -151,11 +151,25 @@ func deliverCmd(args []string) error {
 	dir := fs.String("dir", "", "take directory")
 	codec := fs.String("codec", "pcm_s24le", "pcm_s24le, pcm_s16le or pcm_f32le")
 	minFrames := fs.Int64("min-frames", 0, "drop segments shorter than this")
+	chain := fs.String("chain", "", `post-processing chain JSON: [{"id":"<AU id or plugin path>","state":"<optional state file>"}, ...]`)
+	label := fs.String("label", "processed", "output folder name under deliver/ for a processed print")
+	tail := fs.Int64("tail", 0, "frames of plugin decay to keep after each segment")
 	fs.Parse(args)
+	var plugins []deliver.Plugin
+	if *chain != "" {
+		b, err := os.ReadFile(*chain)
+		if err != nil {
+			return err
+		}
+		if err := json.Unmarshal(b, &plugins); err != nil {
+			return fmt.Errorf("%s: %w", *chain, err)
+		}
+	}
 	if *dir == "" {
 		return errors.New("deliver: -dir is required")
 	}
-	rep, err := deliver.Render(context.Background(), *dir, deliver.Options{Codec: *codec, MinFrames: *minFrames})
+	rep, err := deliver.Render(context.Background(), *dir, deliver.Options{Codec: *codec, MinFrames: *minFrames,
+		Chain: plugins, Label: *label, TailFrames: *tail, Renderer: siblingTool("rs-render")})
 	if err != nil {
 		return err
 	}
@@ -166,8 +180,15 @@ func deliverCmd(args []string) error {
 		fmt.Fprintf(os.Stderr, "warning: placement is only known to ±%d frames (transport source is not sample-accurate)\n", rep.UncertaintyFrames)
 	}
 	for _, d := range rep.Deliverables {
-		fmt.Printf("%s\ttimeline %d\tsession +%d\t%d frames\tverified (max error %.2f LSB)\n",
-			d.File, d.TimeReference, d.SessionOffset, d.Segment.Frames, d.MaxErrorLSB)
+		check := fmt.Sprintf("verified (max error %.2f LSB)", d.MaxErrorLSB)
+		if d.Chain != nil {
+			check = fmt.Sprintf("chain latency %d compensated", d.Chain.Latency)
+			if d.Alignment != nil && d.Alignment.Checked {
+				check += fmt.Sprintf(", aligned with dry (correlation %.2f)", d.Alignment.Correlation)
+			}
+		}
+		fmt.Printf("%s\ttimeline %d\tsession +%d\t%d frames\t%s\n",
+			d.File, d.TimeReference, d.SessionOffset, d.Segment.Frames, check)
 	}
 	return nil
 }
@@ -262,4 +283,16 @@ func ptslImport(args []string) error {
 		fmt.Printf("imported %s at session +%d samples (timeline %d)\n", d.File, pos, d.TimeReference)
 	}
 	return nil
+}
+
+// siblingTool finds a helper binary next to this executable, falling back
+// to $PATH.
+func siblingTool(name string) string {
+	if exe, err := os.Executable(); err == nil {
+		p := filepath.Join(filepath.Dir(exe), name)
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return name
 }

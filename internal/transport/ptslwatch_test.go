@@ -129,7 +129,10 @@ func TestPTSLWatcher(t *testing.T) {
 	step(func(p *fakePT) { p.state, p.inSample = "TS_TransportPlaying", 96000 })
 	step(func(p *fakePT) { p.state = "TState_TransportStopped" })
 	step(func(p *fakePT) { p.failing = true }) // PTSL outage
-	step(func(p *fakePT) { p.failing = false; p.state, p.inSample, p.preRoll = "TS_TransportRecording", 480000, true })
+	step(func(p *fakePT) {
+		p.failing = false
+		p.state, p.inSample, p.preRoll = "TS_TransportRecording", 480000, true
+	})
 	cancel()
 	<-done
 	log.Close()

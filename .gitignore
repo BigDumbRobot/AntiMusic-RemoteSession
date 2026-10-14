@@ -2,3 +2,4 @@
 *.caf
 *.f32
 .DS_Store
+/native/build/
