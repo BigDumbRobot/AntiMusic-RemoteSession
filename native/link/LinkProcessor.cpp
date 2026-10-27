@@ -29,8 +29,10 @@ juce::File LinkProcessor::linksDirectory()
 {
     if (auto* dir = std::getenv ("RS_LINK_DIR"))
         return juce::File (juce::String::fromUTF8 (dir));
-    return juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
-        .getChildFile ("AntiMusic/RemoteSession/links");
+    // On macOS JUCE's userApplicationDataDirectory is ~/Library, so name
+    // Application Support explicitly. Must match link.Dir() in Go.
+    return juce::File::getSpecialLocation (juce::File::userHomeDirectory)
+        .getChildFile ("Library/Application Support/AntiMusic/RemoteSession/links");
 }
 
 bool LinkProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const

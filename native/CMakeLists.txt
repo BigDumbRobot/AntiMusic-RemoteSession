@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.22)
 
 set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Minimum macOS version")
+# Universal by default: Pro Tools may run natively or under Rosetta.
+set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "Target architectures")
 
 project(RemoteSessionNative VERSION 0.1.0 LANGUAGES C CXX)
 

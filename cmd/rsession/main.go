@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -31,7 +32,7 @@ commands:
   devices        list CoreAudio input devices
   record         record a lossless master, journaling DAW transport
   deliver        render placed BWF deliverables from a take and verify them
-  links          list RemoteSession Link plugin instances
+  links          list RemoteSession Link plugin instances (-watch <track> for live diagnostics)
   ptsl-status    show Pro Tools session and transport via PTSL
   ptsl-import    import a take's deliverables into Pro Tools at their positions
 `
@@ -50,7 +51,7 @@ func main() {
 	case "deliver":
 		err = deliverCmd(args)
 	case "links":
-		err = links()
+		err = links(args)
 	case "ptsl-status":
 		err = ptslStatus(args)
 	case "ptsl-import":
@@ -306,7 +307,14 @@ func siblingTool(name string) string {
 	return name
 }
 
-func links() error {
+func links(args []string) error {
+	fs := flag.NewFlagSet("links", flag.ExitOnError)
+	watch := fs.String("watch", "", "print live transport changes and onsets for a Link instance (track name or .rslink path)")
+	onset := fs.Float64("onset", 0.5, "with -watch: peak level (0-1) that counts as an onset after silence")
+	fs.Parse(args)
+	if *watch != "" {
+		return watchLink(*watch, *onset)
+	}
 	infos, err := link.List(link.Dir())
 	if err != nil {
 		return err
@@ -321,26 +329,156 @@ func links() error {
 	return nil
 }
 
-// recordLink records a Link plugin instance. Transport events come from
-// the plugin's per-block host positions, so placement is exact.
-func recordLink(ctx context.Context, sel, dir, codec string, sess *take.Session) error {
+// openLink opens a Link instance by .rslink path, or by track name (the
+// newest active instance on that track wins).
+func openLink(sel string) (*link.Ring, error) {
 	path := sel
 	if !strings.HasSuffix(sel, ".rslink") {
 		infos, err := link.List(link.Dir())
 		if err != nil {
-			return err
+			return nil, err
 		}
 		path = ""
 		for _, i := range infos {
 			if i.Alive && i.State == link.StateActive && i.TrackName == sel {
-				path = i.Path // newest instance wins
+				path = i.Path
 			}
 		}
 		if path == "" {
-			return fmt.Errorf("no active Link instance on a track named %q (see rsession links)", sel)
+			return nil, fmt.Errorf("no active Link instance on a track named %q (see rsession links)", sel)
 		}
 	}
-	ring, err := link.Open(path)
+	return link.Open(path)
+}
+
+// watchLink prints what the host tells a Link instance: transport state
+// changes, how the timeline position moves, and the exact timeline sample
+// of each onset (a peak after silence). It is a diagnostic for checking
+// host behaviour, e.g. delay compensation and the stopped state.
+func watchLink(sel string, onset float64) error {
+	ring, err := openLink(sel)
+	if err != nil {
+		return err
+	}
+	defer ring.Close()
+	rate := ring.SampleRate
+	fmt.Printf("watching Link %q (%s), %.0f Hz, %d ch. Ctrl-C to stop.\n", ring.TrackName, ring.HostName, rate, ring.Channels)
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	rd := ring.NewReader(true)
+	tick := time.NewTicker(5 * time.Millisecond)
+	defer tick.Stop()
+
+	var (
+		prev     link.Block
+		have     bool
+		motion   string
+		quiet    int64 // consecutive frames below onset/10
+		armAfter = int64(rate / 10)
+		blocks   int
+		last     = time.Now()
+	)
+	pos := func(b link.Block, off int64) string {
+		if b.Flags&link.HasTimeline == 0 {
+			return fmt.Sprintf("stream frame %d (no timeline)", int64(b.Frame)+off)
+		}
+		s := b.TimelineSample + off
+		return fmt.Sprintf("timeline %d (%s)", s, clock(s, rate))
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-tick.C:
+		}
+		bs, lost := rd.Read()
+		if lost > 0 {
+			fmt.Printf("! %d blocks lost (reader fell behind)\n", lost)
+		}
+		for _, b := range bs {
+			blocks++
+			if !have || b.Flags != prev.Flags {
+				fmt.Printf("state %-20s at %s, block %d frames\n", flagNames(b.Flags), pos(b, 0), b.Frames)
+				motion = ""
+			}
+			if have && b.Flags&prev.Flags&link.HasTimeline != 0 {
+				d := b.TimelineSample - prev.TimelineSample
+				m := "jump"
+				switch d {
+				case int64(prev.Frames):
+					m = "advancing"
+				case 0:
+					m = "static"
+				}
+				if m == "jump" {
+					fmt.Printf("jump  %+d samples: %d -> %s\n", d-int64(prev.Frames), prev.TimelineSample+int64(prev.Frames), pos(b, 0))
+				} else if m != motion {
+					fmt.Printf("position %s at %s\n", m, pos(b, 0))
+				}
+				motion = m
+			}
+			ch := ring.Channels
+			for f := 0; f < int(b.Frames); f++ {
+				peak := 0.0
+				for c := 0; c < ch; c++ {
+					if v := math.Abs(float64(b.Audio[f*ch+c])); v > peak {
+						peak = v
+					}
+				}
+				switch {
+				case peak >= onset && quiet >= armAfter:
+					fmt.Printf("onset peak %.3f at %s\n", peak, pos(b, int64(f)))
+					quiet = 0
+				case peak < onset/10:
+					quiet++
+				default:
+					quiet = 0
+				}
+			}
+			prev, have = b, true
+		}
+		if time.Since(last) >= 2*time.Second {
+			if have {
+				fmt.Printf("…     %d blocks in %.0fs, now %s, %s\n", blocks, time.Since(last).Seconds(), flagNames(prev.Flags), pos(prev, 0))
+			} else {
+				fmt.Printf("…     no blocks in %.0fs (host is not calling the plugin)\n", time.Since(last).Seconds())
+			}
+			blocks, last = 0, time.Now()
+		}
+	}
+}
+
+func flagNames(f uint32) string {
+	var parts []string
+	if f&link.Playing != 0 {
+		parts = append(parts, "playing")
+	} else {
+		parts = append(parts, "stopped")
+	}
+	if f&link.Recording != 0 {
+		parts = append(parts, "recording")
+	}
+	if f&link.HasTimeline == 0 {
+		parts = append(parts, "no-timeline")
+	}
+	return strings.Join(parts, "+")
+}
+
+// clock formats a sample position as h:mm:ss.mmm from sample 0.
+func clock(s int64, rate float64) string {
+	sign := ""
+	if s < 0 {
+		sign, s = "-", -s
+	}
+	ms := int64(float64(s) * 1000 / rate)
+	return fmt.Sprintf("%s%d:%02d:%02d.%03d", sign, ms/3600000, ms/60000%60, ms/1000%60, ms%1000)
+}
+
+// recordLink records a Link plugin instance. Transport events come from
+// the plugin's per-block host positions, so placement is exact.
+func recordLink(ctx context.Context, sel, dir, codec string, sess *take.Session) error {
+	ring, err := openLink(sel)
 	if err != nil {
 		return err
 	}
