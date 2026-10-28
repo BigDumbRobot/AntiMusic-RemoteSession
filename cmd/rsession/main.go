@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -96,9 +97,7 @@ func record(args []string) error {
 	start := fs.String("session-start", "00:00:00:00", "session start timecode (without -ptsl)")
 	fps := fs.String("fps", "25", "timecode rate for -session-start: 23.976 24 25 29.97 29.97df 30 50 59.94 59.94df 60")
 	code := fs.String("code", "", "also copy the take live to the studio with this pairing code")
-	relay := fs.String("relay", "", "relay host[:port] for -code (default $RS_RELAY, or the built-in relay)")
-	sendTo := fs.String("send", "", fmt.Sprintf("instead of -code: copy directly to a receiver at host[:port] (default port %d)", xfer.DefaultPort))
-	token := fs.String("token", "", "with -send: shared token (default $RS_TOKEN)")
+	relay := fs.String("relay", "", "optional relay host[:port], only for relay codes (default $RS_RELAY)")
 	fs.Parse(args)
 	if (*device == "") == (*linkSel == "") || *dir == "" {
 		return errors.New("record: -dir and exactly one of -device or -link are required")
@@ -106,11 +105,11 @@ func record(args []string) error {
 	if _, err := os.Stat(*dir); err == nil {
 		return fmt.Errorf("record: %s already exists; pick a new take directory", *dir)
 	}
-	if *sendTo == "" && *code == "" {
+	if *code == "" {
 		return recordTake(*dir, *device, *linkSel, *latency, *codec, *usePTSL, *addr, *poll, *rate, *start, *fps)
 	}
 
-	s, resume, err := newSender(*dir, *code, *relay, *sendTo, *token)
+	s, resume, err := newSender(*dir, *code, *relay)
 	if err != nil {
 		return err
 	}
@@ -395,7 +394,8 @@ func importTake(ctx context.Context, dir, addr, dest string) ([]string, error) {
 // (make RELAY=host:port sets it via -ldflags).
 var defaultRelay = ""
 
-// relayAddr picks the relay: flag, then $RS_RELAY, then the built-in one.
+// relayAddr picks the optional relay: flag, then $RS_RELAY, then the
+// built-in one. "" means none.
 func relayAddr(flagVal string) (string, error) {
 	r := flagVal
 	if r == "" {
@@ -405,7 +405,7 @@ func relayAddr(flagVal string) (string, error) {
 		r = defaultRelay
 	}
 	if r == "" {
-		return "", errors.New("no relay configured: pass -relay host:port, set RS_RELAY, or build with make RELAY=host:port")
+		return "", nil // no relay: direct, peer-to-peer
 	}
 	if _, _, err := net.SplitHostPort(r); err != nil {
 		r = net.JoinHostPort(r, strconv.Itoa(pair.DefaultRelayPort))
@@ -413,29 +413,27 @@ func relayAddr(flagVal string) (string, error) {
 	return r, nil
 }
 
-// newSender builds a sender for a pairing code (through the relay) or a
-// direct address. It also returns the command that resumes the upload.
-func newSender(dir, code, relay, to, token string) (*xfer.Sender, string, error) {
-	switch {
-	case code != "" && to != "":
-		return nil, "", errors.New("use either a pairing code or a direct address, not both")
-	case code != "":
-		c, err := pair.ParseCode(code)
-		if err != nil {
-			return nil, "", err
-		}
-		r, err := relayAddr(relay)
-		if err != nil {
-			return nil, "", err
-		}
-		s := &xfer.Sender{Dir: dir, Addr: "studio " + c.ID, Logf: logStderr,
-			Dial: func(ctx context.Context) (net.Conn, error) { return pair.Dial(ctx, r, c) }}
-		return s, fmt.Sprintf("rsession send -dir %s -code %s", dir, c), nil
-	case to != "":
-		s := &xfer.Sender{Dir: dir, Addr: sendAddr(to), Token: tokenOr(token), Logf: logStderr}
-		return s, fmt.Sprintf("rsession send -dir %s -to %s", dir, to), nil
+// newSender builds a sender for the studio's pairing code. It also returns
+// the command that resumes the upload.
+func newSender(dir, code, relay string) (*xfer.Sender, string, error) {
+	if code == "" {
+		return nil, "", errors.New("give the studio's pairing code with -code")
 	}
-	return nil, "", errors.New("give the studio's pairing code with -code")
+	c, err := pair.ParseCode(code)
+	if err != nil {
+		return nil, "", err
+	}
+	r, err := relayAddr(relay)
+	if err != nil {
+		return nil, "", err
+	}
+	label := "studio " + c.ID
+	if c.IsDirect() {
+		label = "studio at " + c.Addr.String()
+	}
+	s := &xfer.Sender{Dir: dir, Addr: label, Logf: logStderr,
+		Dial: func(ctx context.Context) (net.Conn, error) { return pair.Connect(ctx, r, c) }}
+	return s, fmt.Sprintf("rsession send -dir %s -code %s", dir, c), nil
 }
 
 // pairingCodeFile holds this studio's code, so it stays the same.
@@ -461,21 +459,6 @@ func studioCode(explicit string, fresh bool) (pair.Code, error) {
 	return c, os.WriteFile(path, []byte(c.String()+"\n"), 0o600)
 }
 
-// sendAddr adds the default port when addr has none.
-func sendAddr(addr string) string {
-	if _, _, err := net.SplitHostPort(addr); err != nil {
-		return net.JoinHostPort(addr, strconv.Itoa(xfer.DefaultPort))
-	}
-	return addr
-}
-
-func tokenOr(flagVal string) string {
-	if flagVal != "" {
-		return flagVal
-	}
-	return os.Getenv("RS_TOKEN")
-}
-
 func logStderr(format string, a ...any) {
 	fmt.Fprintf(os.Stderr, "%s %s\n", time.Now().Format("15:04:05"), fmt.Sprintf(format, a...))
 }
@@ -484,14 +467,12 @@ func sendCmd(args []string) error {
 	fs := flag.NewFlagSet("send", flag.ExitOnError)
 	dir := fs.String("dir", "", "take directory")
 	code := fs.String("code", "", "the studio's pairing code")
-	relay := fs.String("relay", "", "relay host[:port] (default $RS_RELAY, or the built-in relay)")
-	to := fs.String("to", "", fmt.Sprintf("instead of -code: receiver host[:port] for a direct connection (default port %d)", xfer.DefaultPort))
-	token := fs.String("token", "", "with -to: shared token (default $RS_TOKEN)")
+	relay := fs.String("relay", "", "optional relay host[:port], only for relay codes (default $RS_RELAY)")
 	fs.Parse(args)
 	if *dir == "" {
 		return errors.New("send: -dir is required")
 	}
-	s, _, err := newSender(*dir, *code, *relay, *to, *token)
+	s, _, err := newSender(*dir, *code, *relay)
 	if err != nil {
 		return err
 	}
@@ -519,12 +500,12 @@ func reportSend(res *xfer.Result, err error) error {
 
 func receiveCmd(args []string) error {
 	fs := flag.NewFlagSet("receive", flag.ExitOnError)
-	relay := fs.String("relay", "", "relay host[:port] (default $RS_RELAY, or the built-in relay)")
-	codeFlag := fs.String("code", "", "use this pairing code instead of the studio's saved one")
-	newCode := fs.Bool("new-code", false, "replace the studio's saved pairing code (old code stops working)")
-	listen := fs.String("listen", "", fmt.Sprintf("instead of a relay: accept direct connections on this address (e.g. :%d)", xfer.DefaultPort))
+	port := fs.Int("port", xfer.DefaultPort, "TCP port to accept musicians on (also requested on the router)")
+	public := fs.String("public", "", "public ip[:port] when you forwarded the port on the router yourself (skips automatic setup)")
+	relay := fs.String("relay", "", "optional relay host[:port] instead of a direct connection (default $RS_RELAY)")
+	codeFlag := fs.String("code", "", "use this pairing code's secret instead of the studio's saved one")
+	newCode := fs.Bool("new-code", false, "replace the studio's saved secret (old codes stop working)")
 	dir := fs.String("dir", "", "folder to receive takes into")
-	token := fs.String("token", "", "shared token senders must present (default $RS_TOKEN)")
 	doDeliver := fs.Bool("deliver", false, "render placed BWF files when a take arrives")
 	doImport := fs.Bool("import", false, "also import them into the open Pro Tools session (implies -deliver)")
 	addr := fs.String("ptsl-addr", ptsl.DefaultAddress, "PTSL address (with -import)")
@@ -533,11 +514,7 @@ func receiveCmd(args []string) error {
 	if *dir == "" {
 		return errors.New("receive: -dir is required")
 	}
-	tok := tokenOr(*token)
-	if *listen != "" && tok == "" {
-		logStderr("receive: no -token set; any sender that can reach this port can send takes")
-	}
-	rv := &xfer.Receiver{Root: *dir, Token: tok, Logf: logStderr}
+	rv := &xfer.Receiver{Root: *dir, Logf: logStderr}
 	if *doDeliver || *doImport {
 		rv.OnComplete = func(ctx context.Context, dir string) (string, error) {
 			rep, err := deliver.Render(ctx, dir, deliver.Options{Codec: "pcm_s24le", Renderer: siblingTool("rs-render")})
@@ -565,31 +542,73 @@ func receiveCmd(args []string) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	code, err := studioCode(*codeFlag, *newCode)
+	if err != nil {
+		return err
+	}
+	logf := func(f string, a ...any) { logStderr("receive: "+f, a...) }
+	r, err := relayAddr(*relay)
+	if err != nil {
+		return err
+	}
 	var ln net.Listener
-	if *listen != "" {
-		l, err := net.Listen("tcp", *listen)
-		if err != nil {
-			return err
-		}
-		ln = l
-		logStderr("receive: listening on %s, takes go to %s", ln.Addr(), *dir)
-	} else {
-		r, err := relayAddr(*relay)
-		if err != nil {
-			return err
-		}
-		code, err := studioCode(*codeFlag, *newCode)
-		if err != nil {
-			return err
-		}
-		l, err := pair.Listen(ctx, r, code, func(f string, a ...any) { logStderr("receive: "+f, a...) })
+	if r != "" {
+		l, err := pair.Listen(ctx, r, code, logf)
 		if err != nil {
 			return err
 		}
 		defer l.Close()
 		ln = l
-		fmt.Fprintf(os.Stderr, "\n    Pairing code:  %s\n\n    Give this to the musician. Takes go to %s\n\n", code, *dir)
+		fmt.Fprintf(os.Stderr, "\n    Pairing code:  %s   (through relay %s)\n\n    Give this to the musician. Takes go to %s\n\n", code, r, *dir)
+		return rv.Serve(ctx, ln)
 	}
+
+	// Direct: the musician connects straight to this machine.
+	tl, err := net.Listen("tcp4", fmt.Sprintf(":%d", *port))
+	if err != nil {
+		return fmt.Errorf("cannot listen on port %d (another receive running?): %w", *port, err)
+	}
+	var pub netip.AddrPort
+	lanOnly := false
+	mapped := make(chan struct{})
+	close(mapped)
+	if *public != "" {
+		if pub, err = netip.ParseAddrPort(*public); err != nil {
+			a, perr := netip.ParseAddr(*public)
+			if perr != nil || !a.Is4() {
+				return fmt.Errorf("-public: want an IPv4 address like 70.24.77.77 or 70.24.77.77:%d", *port)
+			}
+			pub = netip.AddrPortFrom(a, uint16(*port))
+		}
+	} else {
+		mctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		m, err := pair.MapPort(mctx, *port, *port)
+		cancel()
+		if err == nil {
+			pub = m.External
+			logf("opened port %d on the router (%s), reachable at %s", m.External.Port(), m.Method, m.External)
+			mapped = make(chan struct{})
+			go func() { defer close(mapped); m.Keep(ctx, logf) }() // removed again on exit
+		} else {
+			local, lerr := pair.LocalIPv4()
+			if lerr != nil {
+				return fmt.Errorf("%v; and no local network address: %v", err, lerr)
+			}
+			pub, lanOnly = netip.AddrPortFrom(local, uint16(*port)), true
+			logf("%v", err)
+		}
+	}
+	defer func() { stop(); <-mapped }()
+	l := pair.ListenDirect(ctx, tl, code, logf)
+	defer l.Close()
+	ln = l
+	fmt.Fprintf(os.Stderr, "\n    Pairing code:  %s\n\n    Give this to the musician. Takes go to %s\n", code.Direct(pub), *dir)
+	if lanOnly {
+		fmt.Fprintf(os.Stderr, "\n    This code only works on this studio's own network: the router would not open a port.\n"+
+			"    To work from anywhere, turn on UPnP in the router, or forward TCP port %d to %s\n"+
+			"    and run again with -public <your public IP>.\n", *port, pub.Addr())
+	}
+	fmt.Fprintln(os.Stderr)
 	return rv.Serve(ctx, ln)
 }
 

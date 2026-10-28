@@ -23,8 +23,7 @@ The native build downloads JUCE 8.0.10 on first run; pass
 ```sh
 make          # bin/rs-capture (C, CoreAudio), Go tools, bin/rs-render and the Link plugin
 make go       # Go tools only: bin/rsession, bin/loopbacktest, bin/ptslverify
-make RELAY=relay.example.com   # same, with a relay built into rsession
-make relay-linux                # bin/linux/rs-relay for a server (or deploy/relay/Dockerfile)
+make relay-linux                # optional: bin/linux/rs-relay for a server (or deploy/relay/Dockerfile)
 make test     # unit and end-to-end tests (needs ffmpeg; PTSL schema tests need Pro Tools installed)
 ```
 
@@ -49,15 +48,17 @@ bin/rsession ptsl-status
 bin/rsession links                                     # running Link instances
 bin/rsession record -link "Vox" -dir takes/take3
 
-# Remote: record at home, land the take on the studio machine. Both sides
-# connect out to a relay (cmd/rs-relay), so no VPN or port forwarding.
-# Studio (prints its pairing code, keeps it between runs; delivers and imports):
+# Remote: record at home, land the take on the studio machine. Peer to peer:
+# the studio's router opens a port automatically (UPnP / NAT-PMP), and the
+# pairing code carries the studio's address. No server, VPN or account.
+# Studio (prints its code; delivers and imports into the open session):
 bin/rsession receive -dir takes/received -import
 # Home (regular Pro Tools, tracks sent to Audio Bridge, timing via PTSL):
-bin/rsession record -device "Pro Tools Audio Bridge 2-A" -dir takes/home1 -ptsl -code 7KQM-4MDX-R2PA
+bin/rsession record -device "Pro Tools Audio Bridge 2-A" -dir takes/home1 -ptsl -code 8RC4TK-8WX0K7-GDZCFA
 # If the link drops, recording carries on; finish or re-send any take with:
-bin/rsession send -dir takes/home1 -code 7KQM-4MDX-R2PA
-# Relay address: built in with `make RELAY=host:port`, or -relay / $RS_RELAY.
+bin/rsession send -dir takes/home1 -code 8RC4TK-8WX0K7-GDZCFA
+# Router won't open ports: forward TCP 7400 yourself and add -public <your IP>,
+# or run an optional rs-relay and use -relay host:port on both sides.
 
 # Post-processing print through a plugin chain:
 bin/rsession deliver -dir takes/take1 -chain chain.json -label limited -tail 4800
@@ -84,8 +85,8 @@ bin/ptslverify -dir /tmp/rs-verify    # needs Pro Tools running; makes and disca
 | `internal/timeline` | transport events → placed segments, timecode, capture clock |
 | `internal/deliver` | BWF rendering and independent verification |
 | `internal/xfer` | live take copy: ships growth, verifies blocks, resumes |
-| `internal/pair` | pairing codes, encrypted handshake, relay server and client |
-| `cmd/rs-relay`, `deploy/relay/` | the relay and its container |
+| `internal/pair` | pairing codes, encrypted handshake, router port mapping, optional relay |
+| `cmd/rs-relay`, `deploy/relay/` | optional relay and its container |
 | `internal/ptsl` | Pro Tools Scripting Library client |
 | `internal/transport` | PTSL transport watcher |
 | `internal/wav`, `internal/caf`, `internal/pcm` | file readers used for verification |

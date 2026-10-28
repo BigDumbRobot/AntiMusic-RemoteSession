@@ -54,7 +54,7 @@ func codeKey(c Code) []byte {
 	if k, ok := keyCache.Load(c); ok {
 		return k.([]byte)
 	}
-	k := argon2.IDKey([]byte(c.Secret), []byte("rs-pair-v1|"+c.ID), 2, 64*1024, 4, 32)
+	k := argon2.IDKey([]byte(c.Secret), []byte("rs-pair-v1|"+c.salt()), 2, 64*1024, 4, 32)
 	keyCache.Store(c, k)
 	return k
 }

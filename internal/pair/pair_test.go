@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,7 +21,7 @@ import (
 
 func TestParseCode(t *testing.T) {
 	c := NewCode()
-	for _, s := range []string{c.String(), strings.ToLower(c.String()), strings.ReplaceAll(c.String(), "-", " ")} {
+	for _, s := range []string{c.String(), strings.ToLower(c.String()), strings.ReplaceAll(c.String(), "-", " "), c.String() + "\n"} {
 		got, err := ParseCode(s)
 		if err != nil || got != c {
 			t.Fatalf("ParseCode(%q) = %v, %v; want %v", s, got, err, c)
@@ -283,5 +284,74 @@ func TestTakeOverRelayWithDrop(t *testing.T) {
 	got, err := os.ReadFile(filepath.Join(rv.Root, res.Dir, take.MasterFile))
 	if err != nil || !bytes.Equal(got, master) {
 		t.Fatalf("master differs after relay transfer (%v)", err)
+	}
+}
+
+func TestDirectCodeRoundTrip(t *testing.T) {
+	for _, a := range []string{"70.24.77.77:7400", "1.2.3.4:65535", "192.168.2.187:40001"} {
+		c := NewCode().Direct(netip.MustParseAddrPort(a))
+		s := c.String()
+		if len(s) != 20 {
+			t.Fatalf("%q has length %d", s, len(s))
+		}
+		got, err := ParseCode(strings.ToLower(s))
+		if err != nil || got != c {
+			t.Fatalf("ParseCode(%q) = %+v, %v; want %+v", s, got, err, c)
+		}
+	}
+	// A typo in the address part is caught, not dialled.
+	c := NewCode().Direct(netip.MustParseAddrPort("70.24.77.77:7400")).String()
+	bad := []byte(c)
+	bad[9] = map[bool]byte{true: 'Z', false: '0'}[bad[9] != 'Z']
+	if got, err := ParseCode(string(bad)); err == nil && got.Addr.String() == "70.24.77.77:7400" {
+		t.Fatal("typo produced the same address")
+	}
+}
+
+func TestDirectTakeWithDropAndWrongCode(t *testing.T) {
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "home", "take1")
+	os.MkdirAll(src, 0o755)
+	take.WriteManifest(src, &take.Manifest{Version: 1, Created: time.Now(), State: take.StateComplete})
+	master := make([]byte, 4_000_000)
+	rand.Read(master)
+	os.WriteFile(filepath.Join(src, take.MasterFile), master, 0o644)
+
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	studio := NewCode()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	l := ListenDirect(ctx, ln, studio, t.Logf)
+	defer l.Close()
+	rv := &xfer.Receiver{Root: filepath.Join(tmp, "studio"), Logf: t.Logf}
+	go rv.Serve(ctx, l)
+	code := studio.Direct(ln.Addr().(*net.TCPAddr).AddrPort())
+
+	wrong := code
+	wrong.Secret = NewCode().Secret
+	if _, err := Connect(ctx, "", wrong); !errors.Is(err, ErrBadCode) {
+		t.Fatalf("wrong code: got %v", err)
+	}
+
+	cuts := 1
+	s := &xfer.Sender{Dir: src, Addr: "studio", Logf: t.Logf, Poll: 10 * time.Millisecond,
+		Dial: func(ctx context.Context) (net.Conn, error) {
+			c, err := Connect(ctx, "", code)
+			if err == nil && cuts > 0 {
+				cuts--
+				go func() { time.Sleep(30 * time.Millisecond); c.Close() }()
+			}
+			return c, err
+		}}
+	res, err := s.Run(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile(filepath.Join(rv.Root, res.Dir, take.MasterFile))
+	if !bytes.Equal(got, master) {
+		t.Fatal("master differs after direct transfer")
 	}
 }
