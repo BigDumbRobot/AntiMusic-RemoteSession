@@ -33,6 +33,8 @@ type Receiver struct {
 	// OnComplete runs after a take's copy is verified (e.g. deliver and
 	// import). Its summary or error is reported back to the sender.
 	OnComplete func(ctx context.Context, dir string) (summary string, err error)
+	// OnStart is told when a sender starts or resumes a take.
+	OnStart func(dir string)
 
 	mu     sync.Mutex
 	active map[string]*conn // by take directory
@@ -164,6 +166,9 @@ func (rv *Receiver) handle(ctx context.Context, c net.Conn) error {
 		return err
 	}
 	rv.logf("receive: %s: take %q -> %s", c.RemoteAddr(), h.Take, dir)
+	if rv.OnStart != nil {
+		rv.OnStart(dir)
+	}
 
 	var received int64
 	lastLog := time.Now()

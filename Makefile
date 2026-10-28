@@ -1,4 +1,4 @@
-.PHONY: all go native test clean relay-linux
+.PHONY: all go native test clean relay-linux app
 
 JUCE_DIR ?=
 # Relay built into rsession, e.g. make RELAY=relay.example.com:7401
@@ -31,3 +31,28 @@ test:
 
 clean:
 	rm -rf bin native/build
+
+# RemoteSession.app: the window app with rsession and helpers inside.
+# Universal (Apple Silicon + Intel); ad-hoc signed.
+APP := build/RemoteSession.app
+app: native
+	rm -rf $(APP) build/app-tmp && mkdir -p $(APP)/Contents/MacOS $(APP)/Contents/Resources/bin build/app-tmp
+	swiftc -parse-as-library -O -target arm64-apple-macos13 -o build/app-tmp/ui-arm64 app/RemoteSession/main.swift
+	swiftc -parse-as-library -O -target x86_64-apple-macos13 -o build/app-tmp/ui-x86_64 app/RemoteSession/main.swift
+	lipo -create -output $(APP)/Contents/MacOS/RemoteSession build/app-tmp/ui-arm64 build/app-tmp/ui-x86_64
+	GOARCH=arm64 go build -ldflags "-X main.defaultRelay=$(RELAY)" -o build/app-tmp/rsession-arm64 ./cmd/rsession
+	GOARCH=amd64 go build -ldflags "-X main.defaultRelay=$(RELAY)" -o build/app-tmp/rsession-amd64 ./cmd/rsession
+	lipo -create -output $(APP)/Contents/Resources/bin/rsession build/app-tmp/rsession-arm64 build/app-tmp/rsession-amd64
+	clang -O2 -Wall -Wextra -std=c11 -arch arm64 -arch x86_64 -mmacosx-version-min=11.0 -framework CoreAudio -framework CoreFoundation \
+		-o $(APP)/Contents/Resources/bin/rs-capture native/capture/rs-capture.c
+	cp native/build/rs-render_artefacts/Release/rs-render $(APP)/Contents/Resources/bin/
+	cp app/RemoteSession/Info.plist $(APP)/Contents/
+	mkdir -p build/app-tmp/AppIcon.iconset
+	for s in 16 32 128 256 512; do \
+		sips -s format png -z $$s $$s "Anti-Music Logo.jpeg" --out build/app-tmp/AppIcon.iconset/icon_$${s}x$${s}.png >/dev/null; \
+		sips -s format png -z $$((s*2)) $$((s*2)) "Anti-Music Logo.jpeg" --out build/app-tmp/AppIcon.iconset/icon_$${s}x$${s}@2x.png >/dev/null; \
+	done
+	iconutil -c icns -o $(APP)/Contents/Resources/AppIcon.icns build/app-tmp/AppIcon.iconset
+	codesign --force --deep --sign - $(APP)
+	rm -rf build/app-tmp
+	@echo "built $(APP)"

@@ -30,6 +30,29 @@ make test     # unit and end-to-end tests (needs ffmpeg; PTSL schema tests need 
 Plugin builds land in `native/build/RemoteSessionLink_artefacts/Release/`.
 The AAX build is unsigned (see the blockers in the architecture doc).
 
+## The app
+
+`make app` builds `build/RemoteSession.app` (Apple Silicon and Intel, macOS 13+)
+with `rsession` and its helpers inside. Nothing else needs installing.
+
+- **Studio** tab: goes online when the app opens and shows the studio code in
+  large type with **Copy code** and **Copy invite** (code plus instructions to
+  paste into a message). Incoming takes are listed as they arrive and, with
+  the toggle on, imported into the open Pro Tools session. Quitting closes the
+  router port again. Takes are kept in `~/Music/RemoteSession/Received`.
+- **Send to a studio** tab: paste a code, pick what to record, press Record.
+  Sources: a track with the RemoteSession Link plugin in any DAW (AU/VST3;
+  AAX needs signing for retail Pro Tools), or an audio input such as Pro Tools
+  Audio Bridge, placed with Pro Tools' transport.
+
+Takes land at the same distance from the session start as they were recorded,
+whatever DAW or start time the sender used; the delivered BWF files keep the
+sender's original timestamp too.
+
+The app is ad-hoc signed. Copied to another Mac as a download, macOS blocks it
+until it is opened with right-click > Open (Developer ID signing and
+notarization remove that step).
+
 ## Use
 
 ```sh

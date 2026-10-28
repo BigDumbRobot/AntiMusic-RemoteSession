@@ -3,3 +3,5 @@
 *.f32
 .DS_Store
 /native/build/
+build/
+takes/

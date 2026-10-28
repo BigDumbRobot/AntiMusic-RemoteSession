@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -284,6 +285,9 @@ func connectPTSL(ctx context.Context, addr string) (*ptsl.Client, ptsl.SessionIn
 	defer cancel()
 	if err := c.Register(cctx, "AntiMusic", "RemoteSession"); err != nil {
 		c.Close()
+		if strings.Contains(err.Error(), "connection refused") || strings.Contains(err.Error(), "Unavailable") {
+			return nil, ptsl.SessionInfo{}, errors.New("Pro Tools isn't open, so the take was saved but not imported")
+		}
 		return nil, ptsl.SessionInfo{}, fmt.Errorf("connecting to Pro Tools at %s: %w", addr, err)
 	}
 	s, err := c.Session(cctx)
@@ -367,10 +371,19 @@ func importTake(ctx context.Context, dir, addr, dest string) ([]string, error) {
 		}
 		// Pro Tools Developer 25.6 fails this call with an internal
 		// assertion; -dest avoids it.
-		if err := c.Call(ctx, ptsl.CmdGetSessionPath, nil, &sessPath); err != nil {
-			return nil, fmt.Errorf(`asking Pro Tools for the session folder (pass -dest "<session>/Audio Files" instead): %w`, err)
+		if err := c.Call(ctx, ptsl.CmdGetSessionPath, nil, &sessPath); err == nil && sessPath.SessionPath.Path != "" {
+			audioDir = filepath.Join(filepath.Dir(sessPath.SessionPath.Path), "Audio Files")
+		} else {
+			// Some Pro Tools builds fail this call; keep the audio beside the take.
+			abs, aerr := filepath.Abs(filepath.Join(dir, "imported"))
+			if aerr != nil {
+				return nil, aerr
+			}
+			audioDir = abs
+			if err := os.MkdirAll(audioDir, 0o755); err != nil {
+				return nil, err
+			}
 		}
-		audioDir = filepath.Join(filepath.Dir(sessPath.SessionPath.Path), "Audio Files")
 	}
 	var lines []string
 	for _, d := range rep.Deliverables {
@@ -378,9 +391,12 @@ func importTake(ctx context.Context, dir, addr, dest string) ([]string, error) {
 		if err != nil {
 			return lines, err
 		}
-		pos := d.TimeReference - s.StartSample // PTSL positions are relative to the session start
+		// Takes land at the same distance from the session start as they
+		// were recorded, whatever DAW or start time the sender used. (The
+		// BWF timestamp keeps the sender's absolute position.)
+		pos := d.SessionOffset
 		if pos < 0 {
-			return lines, fmt.Errorf("%s starts at timeline %d, before this session's start %s", d.File, d.TimeReference, s.StartTimecode)
+			return lines, fmt.Errorf("%s starts before the session start", d.File)
 		}
 		if err := c.ImportSpotted(ctx, []string{abs}, audioDir, pos); err != nil {
 			return lines, fmt.Errorf("importing %s: %w", d.File, err)
@@ -510,13 +526,31 @@ func receiveCmd(args []string) error {
 	doImport := fs.Bool("import", false, "also import them into the open Pro Tools session (implies -deliver)")
 	addr := fs.String("ptsl-addr", ptsl.DefaultAddress, "PTSL address (with -import)")
 	dest := fs.String("dest", "", `with -import: folder to copy audio into (default: the session's "Audio Files")`)
+	events := fs.Bool("events", false, "print status as JSON lines on stdout (for the RemoteSession app)")
 	fs.Parse(args)
 	if *dir == "" {
 		return errors.New("receive: -dir is required")
 	}
-	rv := &xfer.Receiver{Root: *dir, Logf: logStderr}
+	var emu sync.Mutex
+	enc := json.NewEncoder(os.Stdout)
+	emit := func(v map[string]any) {
+		if *events {
+			emu.Lock()
+			enc.Encode(v)
+			emu.Unlock()
+		}
+	}
+	logf := func(f string, a ...any) {
+		logStderr("receive: "+f, a...)
+		emit(map[string]any{"type": "log", "text": fmt.Sprintf(f, a...)})
+	}
+	rv := &xfer.Receiver{Root: *dir, Logf: func(f string, a ...any) { logStderr(f, a...) }}
+	rv.OnStart = func(d string) {
+		emit(map[string]any{"type": "take", "take": filepath.Base(d), "state": "receiving", "dir": d})
+	}
+	process := func(ctx context.Context, dir string) (string, error) { return "", nil }
 	if *doDeliver || *doImport {
-		rv.OnComplete = func(ctx context.Context, dir string) (string, error) {
+		process = func(ctx context.Context, dir string) (string, error) {
 			rep, err := deliver.Render(ctx, dir, deliver.Options{Codec: "pcm_s24le", Renderer: siblingTool("rs-render")})
 			if err != nil {
 				return "", fmt.Errorf("deliver: %w", err)
@@ -532,7 +566,7 @@ func receiveCmd(args []string) error {
 				imp, err := importTake(ctx, dir, *addr, *dest)
 				lines = append(lines, imp...)
 				if err != nil {
-					return strings.Join(lines, "\n"), fmt.Errorf("import: %w", err)
+					return strings.Join(lines, "\n"), err
 				}
 			}
 			s := strings.Join(lines, "\n")
@@ -540,13 +574,21 @@ func receiveCmd(args []string) error {
 			return s, nil
 		}
 	}
+	rv.OnComplete = func(ctx context.Context, d string) (string, error) {
+		sum, err := process(ctx, d)
+		ev := map[string]any{"type": "take", "take": filepath.Base(d), "state": "done", "dir": d, "summary": sum, "imported": *doImport && err == nil}
+		if err != nil {
+			ev["state"], ev["error"] = "saved", err.Error() // the copy is complete; only processing failed
+		}
+		emit(ev)
+		return sum, err
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	code, err := studioCode(*codeFlag, *newCode)
 	if err != nil {
 		return err
 	}
-	logf := func(f string, a ...any) { logStderr("receive: "+f, a...) }
 	r, err := relayAddr(*relay)
 	if err != nil {
 		return err
@@ -560,6 +602,7 @@ func receiveCmd(args []string) error {
 		defer l.Close()
 		ln = l
 		fmt.Fprintf(os.Stderr, "\n    Pairing code:  %s   (through relay %s)\n\n    Give this to the musician. Takes go to %s\n\n", code, r, *dir)
+		emit(map[string]any{"type": "code", "code": code.String(), "reach": "relay", "detail": "through relay " + r})
 		return rv.Serve(ctx, ln)
 	}
 
@@ -609,6 +652,14 @@ func receiveCmd(args []string) error {
 			"    and run again with -public <your public IP>.\n", *port, pub.Addr())
 	}
 	fmt.Fprintln(os.Stderr)
+	ev := map[string]any{"type": "code", "code": code.Direct(pub).String(), "reach": "internet", "detail": "reachable from anywhere at " + pub.String()}
+	if lanOnly {
+		ev["reach"] = "lan"
+		ev["detail"] = fmt.Sprintf("Only works on this studio's network: the router would not open a port. Turn on UPnP in the router, or forward TCP port %d to %s.", *port, pub.Addr())
+	} else if *public != "" {
+		ev["detail"] = "using your port forward at " + pub.String()
+	}
+	emit(ev)
 	return rv.Serve(ctx, ln)
 }
 
@@ -801,7 +852,9 @@ func recordLink(ctx context.Context, sel, dir, codec string, sess *take.Session)
 	}
 	defer ring.Close()
 	if sess == nil {
-		return errors.New("record -link needs session details (-ptsl, or -session-rate/-session-start)")
+		// Any DAW: the plugin reports positions from the session start,
+		// so no DAW connection is needed.
+		sess = &take.Session{Source: "link", Name: ring.HostName, SampleRate: int(ring.SampleRate)}
 	}
 	if float64(sess.SampleRate) != ring.SampleRate {
 		return fmt.Errorf("Link runs at %.0f Hz but the session is %d Hz", ring.SampleRate, sess.SampleRate)
