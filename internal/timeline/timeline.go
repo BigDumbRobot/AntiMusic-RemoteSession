@@ -14,7 +14,6 @@ package timeline
 
 import (
 	"errors"
-	"fmt"
 	"sort"
 )
 
@@ -86,14 +85,34 @@ func Segments(events []Event, masterFrames, latency, minFrames int64) ([]Segment
 			seg.Frames -= over
 		}
 		if seg.Frames > 0 && seg.Frames >= minFrames {
-			if seg.TimelineStart < 0 {
-				return nil, fmt.Errorf("timeline: segment at master frame %d starts before 00:00:00:00", seg.MasterStart)
-			}
 			out = append(out, seg)
 		}
 		i = j - 1
 	}
 	return out, nil
+}
+
+// TrimBefore cuts the part of each segment that lies before timeline sample
+// start, dropping segments left shorter than minFrames (or empty). Hosts
+// pre-roll by the delay-compensation amount, so a run started at the
+// session start begins slightly before it; Pro Tools cannot place audio
+// there. It returns the trimmed segments and the number of frames cut.
+func TrimBefore(segs []Segment, start, minFrames int64) ([]Segment, int64) {
+	var out []Segment
+	var cut int64
+	for _, s := range segs {
+		if d := start - s.TimelineStart; d > 0 {
+			d = min(d, s.Frames)
+			s.MasterStart += d
+			s.Frames -= d
+			s.TimelineStart += d
+			cut += d
+		}
+		if s.Frames > 0 && s.Frames >= minFrames {
+			out = append(out, s)
+		}
+	}
+	return out, cut
 }
 
 // normalize sorts events by frame and keeps only the last event recorded

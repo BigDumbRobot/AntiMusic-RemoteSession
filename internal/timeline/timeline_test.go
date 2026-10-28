@@ -141,3 +141,22 @@ func TestCaptureLogSampleTimeBase(t *testing.T) {
 		t.Fatal("corrupt interior line accepted")
 	}
 }
+
+func TestTrimBeforeCutsPreRoll(t *testing.T) {
+	const start = 172_800_000
+	// A run started at the session start with 4100 samples of pre-roll,
+	// one entirely in pre-roll, and one after the start.
+	segs := []Segment{
+		{MasterStart: 1000, Frames: 48000, TimelineStart: start - 4100},
+		{MasterStart: 60000, Frames: 2000, TimelineStart: start - 3000},
+		{MasterStart: 90000, Frames: 500, TimelineStart: start + 100},
+	}
+	got, cut := TrimBefore(segs, start, 0)
+	want := []Segment{
+		{MasterStart: 5100, Frames: 43900, TimelineStart: start},
+		{MasterStart: 90000, Frames: 500, TimelineStart: start + 100},
+	}
+	if !reflect.DeepEqual(got, want) || cut != 4100+2000 {
+		t.Fatalf("got %+v cut %d, want %+v cut %d", got, cut, want, 6100)
+	}
+}

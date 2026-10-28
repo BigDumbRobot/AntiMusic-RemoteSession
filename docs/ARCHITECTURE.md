@@ -245,8 +245,20 @@ Verified in Pro Tools Developer 25.6.0.11 (arm64), 2026-10-27, AAX unsigned,
   does not call the plugin at all (Dynamic Plug-In Processing), so Link
   publishes nothing. Recording tracks are armed, so this is fine for capture;
   it matters if Link is ever used on playback-only tracks.
-- Not yet tested: delay compensation off, loop playback, and a full
-  `record -link` → deliver → `ptsl-import` round trip in Pro Tools.
+- **Position origin:** positions are samples from the **session start**, not
+  from midnight. With the session start moved to 01:00:00:00 the click still
+  read 96007. `link.Pump` adds the session start (`SessionStart`) so take
+  events are absolute like every other source.
+- **Round trip:** `record -link` over three passes started at session +0,
+  +72000 and +90000 (session at 01:00:00:00, pitch plugin upstream), then
+  `deliver` and `ptsl-import`. All three BWFs put the click at timeline
+  172896007 (session +96007), 0 frames lost. The pre-roll before the session
+  start (4096 frames) is trimmed with a warning (`timeline.TrimBefore`);
+  until this fix delivery refused the whole take.
+- **PTSL quirk:** in Developer 25.6, `GetSessionPath` fails with an internal
+  assertion (`Sys_FileLoc.cpp` line 228). `ptsl-import -dest "<session>/Audio Files"`
+  avoids the call.
+- Not yet tested: delay compensation off, loop playback.
 
 ## Blockers and risks
 

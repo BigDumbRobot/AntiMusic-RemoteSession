@@ -148,6 +148,11 @@ func MakePlan(dir string, minFrames int64) (*Plan, *take.Manifest, error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	var cut int64
+	p.Segments, cut = timeline.TrimBefore(p.Segments, m.Session.StartSample, minFrames)
+	if cut > 0 {
+		p.Warnings = append(p.Warnings, fmt.Sprintf("%d frames before the session start (host pre-roll) were left out", cut))
+	}
 	return p, m, nil
 }
 

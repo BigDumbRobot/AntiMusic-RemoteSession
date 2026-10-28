@@ -29,6 +29,9 @@ type fakeWriter struct {
 	frame      uint64
 	blocks     uint64
 	audioStart uint64
+	// sessionStart stamps the test signal with absolute positions while the
+	// published position is session-relative, as Pro Tools reports it.
+	sessionStart int64
 }
 
 func newFakeWriter(t *testing.T, path string, rate float64, ch int, capacity, slots uint64) *fakeWriter {
@@ -62,7 +65,7 @@ func (w *fakeWriter) block(n int, rolling bool, tl int64) {
 		for c := 0; c < w.ch; c++ {
 			v := testsignal.Idle
 			if rolling {
-				v = testsignal.Value(tl+int64(f), c)
+				v = testsignal.Value(w.sessionStart+tl+int64(f), c)
 			}
 			off := w.audioStart + ((w.frame+uint64(f))%w.capacity)*uint64(w.ch)*4 + uint64(c)*4
 			le.PutUint32(w.mem[off:], math.Float32bits(v))
@@ -102,6 +105,7 @@ func TestLinkTakeIsPlacedExactly(t *testing.T) {
 	path := filepath.Join(tmp, "1-1.rslink")
 	// Small ring so the reader can be made to fall behind.
 	w := newFakeWriter(t, path, 48000, 2, 48000, 64)
+	w.sessionStart = start
 	r, err := Open(func() string { w.flush(t, path, StateActive); return path }())
 	if err != nil {
 		t.Fatal(err)
@@ -116,36 +120,36 @@ func TestLinkTakeIsPlacedExactly(t *testing.T) {
 		t.Fatal(err)
 	}
 	clog, _ := os.Create(filepath.Join(takeDir, take.CaptureLog))
-	pump := &Pump{Reader: r.NewReader(false), PCM: pw, Log: clog, Events: rec.Events, Poll: time.Millisecond}
+	pump := &Pump{Reader: r.NewReader(false), PCM: pw, Log: clog, Events: rec.Events, Poll: time.Millisecond, SessionStart: start}
 	var steps []func()
 	steps = append(steps, func() {
 		for i := 0; i < 4; i++ {
-			w.block(512, false, start)
+			w.block(512, false, 0)
 		}
 	})
 	steps = append(steps, func() {
 		for i := int64(0); i < 40; i++ {
-			w.block(512, true, start+96000+i*512)
+			w.block(512, true, 96000+i*512)
 		}
 	})
 	steps = append(steps, func() {
 		for i := 0; i < 8; i++ {
-			w.block(512, false, start+96000+40*512)
+			w.block(512, false, 96000+40*512)
 		}
 	})
 	steps = append(steps, func() {
 		for i := int64(0); i < 20; i++ {
-			w.block(512, true, start+480000+i*512)
+			w.block(512, true, 480000+i*512)
 		}
 		for i := int64(0); i < 10; i++ { // loop jump back
-			w.block(512, true, start+480000+i*512)
+			w.block(512, true, 480000+i*512)
 		}
 	})
 	steps = append(steps, func() {
 		// 100 blocks while the reader is not looking: the 64-slot ring
 		// keeps only the last 64, so 36 are lost and must be filled.
 		for i := int64(0); i < 100; i++ {
-			w.block(512, true, start+480000+(10+i)*512)
+			w.block(512, true, 480000+(10+i)*512)
 		}
 	})
 	steps = append(steps, func() {

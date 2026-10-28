@@ -29,6 +29,10 @@ type Pump struct {
 	Events *take.EventLog
 	Poll   time.Duration
 	Stats  PumpStats
+	// SessionStart (samples since midnight) is added to plugin positions:
+	// hosts report them relative to the session start (verified in Pro
+	// Tools), while take events are absolute.
+	SessionStart int64
 
 	w            *bufio.Writer
 	started      bool
@@ -63,6 +67,9 @@ func (p *Pump) Run(ctx context.Context) error {
 	emit := func(rolling bool, tl int64, note string) error {
 		f := st.Frames
 		st.Events++
+		if rolling {
+			tl += p.SessionStart
+		}
 		return p.Events.Append(take.Event{Frame: &f, Rolling: rolling, TimelineSample: tl, Source: "link", Note: note})
 	}
 	for {

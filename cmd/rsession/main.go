@@ -254,6 +254,7 @@ func ptslImport(args []string) error {
 	fs := flag.NewFlagSet("ptsl-import", flag.ExitOnError)
 	dir := fs.String("dir", "", "take directory (after deliver)")
 	addr := fs.String("ptsl-addr", ptsl.DefaultAddress, "PTSL address")
+	dest := fs.String("dest", "", `folder to copy audio into (default: the session's "Audio Files", asked from Pro Tools)`)
 	fs.Parse(args)
 	if *dir == "" {
 		return errors.New("ptsl-import: -dir is required")
@@ -272,15 +273,20 @@ func ptslImport(args []string) error {
 		return err
 	}
 	defer c.Close()
-	var sessPath struct {
-		SessionPath struct {
-			Path string `json:"path"`
-		} `json:"session_path"`
+	audioDir := *dest
+	if audioDir == "" {
+		var sessPath struct {
+			SessionPath struct {
+				Path string `json:"path"`
+			} `json:"session_path"`
+		}
+		// Pro Tools Developer 25.6 fails this call with an internal
+		// assertion; -dest avoids it.
+		if err := c.Call(ctx, ptsl.CmdGetSessionPath, nil, &sessPath); err != nil {
+			return fmt.Errorf(`asking Pro Tools for the session folder (pass -dest "<session>/Audio Files" instead): %w`, err)
+		}
+		audioDir = filepath.Join(filepath.Dir(sessPath.SessionPath.Path), "Audio Files")
 	}
-	if err := c.Call(ctx, ptsl.CmdGetSessionPath, nil, &sessPath); err != nil {
-		return err
-	}
-	audioDir := filepath.Join(filepath.Dir(sessPath.SessionPath.Path), "Audio Files")
 	for _, d := range rep.Deliverables {
 		abs, err := filepath.Abs(filepath.Join(*dir, d.File))
 		if err != nil {
@@ -504,7 +510,7 @@ func recordLink(ctx context.Context, sel, dir, codec string, sess *take.Session)
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "recording Link %q (%s) -> %s (Ctrl-C to stop)\n", ring.TrackName, ring.HostName, dir)
-	pump := &link.Pump{Reader: ring.NewReader(true), PCM: pw, Log: clog, Events: r.Events}
+	pump := &link.Pump{Reader: ring.NewReader(true), PCM: pw, Log: clog, Events: r.Events, SessionStart: sess.StartSample}
 	perr := pump.Run(ctx)
 	clog.Close()
 	pw.Close()
