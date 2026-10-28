@@ -47,6 +47,14 @@ bin/rsession ptsl-status
 bin/rsession links                                     # running Link instances
 bin/rsession record -link "Vox" -dir takes/take3
 
+# Remote: record at home, land the take on the studio machine.
+# Studio (receives, delivers, imports into the open Pro Tools session):
+RS_TOKEN=<secret> bin/rsession receive -dir takes/received -import
+# Home (records locally and copies live; regular Pro Tools via Audio Bridge + PTSL):
+RS_TOKEN=<secret> bin/rsession record -device "Pro Tools Audio Bridge 2-A" -dir takes/home1 -ptsl -send <studio host>
+# If the link drops, recording carries on; resume or re-send any take with:
+RS_TOKEN=<secret> bin/rsession send -dir takes/home1 -to <studio host>
+
 # Post-processing print through a plugin chain:
 bin/rsession deliver -dir takes/take1 -chain chain.json -label limited -tail 4800
 # chain.json: [{"id":"<AU id or plugin path>","state":"<optional state file>"}]

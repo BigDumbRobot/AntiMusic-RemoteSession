@@ -9,10 +9,12 @@ import (
 	"flag"
 	"fmt"
 	"math"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -24,6 +26,7 @@ import (
 	"antimusic.dev/remotesession/internal/take"
 	"antimusic.dev/remotesession/internal/timeline"
 	"antimusic.dev/remotesession/internal/transport"
+	"antimusic.dev/remotesession/internal/xfer"
 )
 
 const usage = `usage: rsession <command> [flags]
@@ -35,6 +38,8 @@ commands:
   links          list RemoteSession Link plugin instances (-watch <track> for live diagnostics)
   ptsl-status    show Pro Tools session and transport via PTSL
   ptsl-import    import a take's deliverables into Pro Tools at their positions
+  send           copy a take to a receiver (resumes; record -send does this live)
+  receive        accept takes from senders; optionally deliver and import them
 `
 
 func main() {
@@ -56,6 +61,10 @@ func main() {
 		err = ptslStatus(args)
 	case "ptsl-import":
 		err = ptslImport(args)
+	case "send":
+		err = sendCmd(args)
+	case "receive":
+		err = receiveCmd(args)
 	default:
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)
@@ -85,17 +94,75 @@ func record(args []string) error {
 	rate := fs.Int("session-rate", 0, "session sample rate (without -ptsl)")
 	start := fs.String("session-start", "00:00:00:00", "session start timecode (without -ptsl)")
 	fps := fs.String("fps", "25", "timecode rate for -session-start: 23.976 24 25 29.97 29.97df 30 50 59.94 59.94df 60")
+	sendTo := fs.String("send", "", fmt.Sprintf("also copy the take live to a receiver at host[:port] (default port %d)", xfer.DefaultPort))
+	token := fs.String("token", "", "with -send: shared token (default $RS_TOKEN)")
 	fs.Parse(args)
 	if (*device == "") == (*linkSel == "") || *dir == "" {
 		return errors.New("record: -dir and exactly one of -device or -link are required")
 	}
+	if _, err := os.Stat(*dir); err == nil {
+		return fmt.Errorf("record: %s already exists; pick a new take directory", *dir)
+	}
+	if *sendTo == "" {
+		return recordTake(*dir, *device, *linkSel, *latency, *codec, *usePTSL, *addr, *poll, *rate, *start, *fps)
+	}
+
+	// The upload runs beside the recording and never blocks it. It
+	// starts once the recorder has written the take's manifest.
+	sctx, scancel := context.WithCancel(context.Background())
+	defer scancel()
+	var res *xfer.Result
+	var serr error
+	sendDone := make(chan struct{})
+	go func() {
+		defer close(sendDone)
+		for {
+			if _, err := os.Stat(filepath.Join(*dir, take.ManifestFile)); err == nil {
+				break
+			}
+			select {
+			case <-sctx.Done():
+				serr = sctx.Err()
+				return
+			case <-time.After(50 * time.Millisecond):
+			}
+		}
+		s := &xfer.Sender{Dir: *dir, Addr: sendAddr(*sendTo), Token: tokenOr(*token), Logf: logStderr}
+		res, serr = s.Run(sctx)
+	}()
+	rerr := recordTake(*dir, *device, *linkSel, *latency, *codec, *usePTSL, *addr, *poll, *rate, *start, *fps)
+	if _, err := os.Stat(filepath.Join(*dir, take.ManifestFile)); err != nil {
+		scancel() // the recording never started
+	} else {
+		logStderr("send: finishing the copy to %s (Ctrl-C to stop; resume later with: rsession send -dir %s -to %s)", *sendTo, *dir, *sendTo)
+	}
+	ictx, istop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	select {
+	case <-sendDone:
+	case <-ictx.Done():
+		scancel()
+		<-sendDone
+	}
+	istop()
+	if err := reportSend(res, serr); err != nil {
+		if rerr == nil {
+			rerr = fmt.Errorf("take recorded locally in %s, but sending stopped: %w", *dir, err)
+		} else {
+			logStderr("send: %v", err)
+		}
+	}
+	return rerr
+}
+
+func recordTake(dir, device, linkSel string, latency int64, codec string, usePTSL bool, addr string,
+	poll time.Duration, rate int, start, fps string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	var sess *take.Session
 	var client *ptsl.Client
-	if *usePTSL {
-		c, s, err := connectPTSL(ctx, *addr)
+	if usePTSL {
+		c, s, err := connectPTSL(ctx, addr)
 		if err != nil {
 			return err
 		}
@@ -103,33 +170,33 @@ func record(args []string) error {
 		client = c
 		sess = &take.Session{Source: "ptsl", Name: s.Name, SampleRate: s.SampleRate,
 			StartTimecode: s.StartTimecode, TimecodeRate: s.TimecodeRate, StartSample: s.StartSample}
-	} else if *rate > 0 {
-		fr, ok := frameRates[*fps]
+	} else if rate > 0 {
+		fr, ok := frameRates[fps]
 		if !ok {
-			return fmt.Errorf("record: unknown -fps %q", *fps)
+			return fmt.Errorf("record: unknown -fps %q", fps)
 		}
-		n, err := timeline.TimecodeToSamples(*start, fr, *rate)
+		n, err := timeline.TimecodeToSamples(start, fr, rate)
 		if err != nil {
 			return err
 		}
-		sess = &take.Session{Source: "manual", SampleRate: *rate, StartTimecode: *start, StartSample: n}
+		sess = &take.Session{Source: "manual", SampleRate: rate, StartTimecode: start, StartSample: n}
 	}
 
-	if *linkSel != "" {
-		return recordLink(ctx, *linkSel, *dir, *codec, sess)
+	if linkSel != "" {
+		return recordLink(ctx, linkSel, dir, codec, sess)
 	}
 	r, err := recorder.Start(recorder.Config{
-		Dir: *dir, Device: *device,
-		MasterCodec: *codec, LatencyFrames: *latency, Session: sess,
+		Dir: dir, Device: device,
+		MasterCodec: codec, LatencyFrames: latency, Session: sess,
 	})
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "recording %s -> %s (Ctrl-C to stop)\n", *device, filepath.Join(*dir, take.MasterFile))
+	fmt.Fprintf(os.Stderr, "recording %s -> %s (Ctrl-C to stop)\n", device, filepath.Join(dir, take.MasterFile))
 
 	if client != nil {
 		w := &transport.PTSLWatcher{
-			Client: client, Log: r.Events, Interval: *poll, SampleRate: sess.SampleRate, SessionStart: sess.StartSample,
+			Client: client, Log: r.Events, Interval: poll, SampleRate: sess.SampleRate, SessionStart: sess.StartSample,
 			OnError: func(err error) { fmt.Fprintln(os.Stderr, "ptsl (master unaffected):", err) },
 			OnEvent: func(e take.Event) {
 				fmt.Fprintf(os.Stderr, "transport %s at timeline %d (±%d frames)\n", e.Note, e.TimelineSample, e.UncertaintyFrames)
@@ -143,9 +210,9 @@ func record(args []string) error {
 	case <-r.Done():
 		err = r.Wait()
 	}
-	m, _ := take.ReadManifest(*dir)
+	m, _ := take.ReadManifest(dir)
 	if m != nil {
-		fmt.Fprintf(os.Stderr, "take %s: state %s, %d Hz, %d ch\n", *dir, m.State, m.SampleRate, m.Channels)
+		fmt.Fprintf(os.Stderr, "take %s: state %s, %d Hz, %d ch\n", dir, m.State, m.SampleRate, m.Channels)
 	}
 	return err
 }
@@ -259,21 +326,34 @@ func ptslImport(args []string) error {
 	if *dir == "" {
 		return errors.New("ptsl-import: -dir is required")
 	}
-	b, err := os.ReadFile(filepath.Join(*dir, take.DeliverDir, deliver.ReportFile))
+	lines, err := importTake(context.Background(), *dir, *addr, *dest)
+	for _, l := range lines {
+		fmt.Println(l)
+	}
+	return err
+}
+
+// importTake imports a delivered take into the open Pro Tools session.
+// Clips are placed by their absolute timeline position against this
+// session's start, so the recording side's session may start elsewhere.
+func importTake(ctx context.Context, dir, addr, dest string) ([]string, error) {
+	b, err := os.ReadFile(filepath.Join(dir, take.DeliverDir, deliver.ReportFile))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	var rep deliver.Report
 	if err := json.Unmarshal(b, &rep); err != nil {
-		return err
+		return nil, err
 	}
-	ctx := context.Background()
-	c, _, err := connectPTSL(ctx, *addr)
+	c, s, err := connectPTSL(ctx, addr)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer c.Close()
-	audioDir := *dest
+	if rep.Session != nil && rep.Session.SampleRate != s.SampleRate {
+		return nil, fmt.Errorf("take is %d Hz but the open session is %d Hz", rep.Session.SampleRate, s.SampleRate)
+	}
+	audioDir := dest
 	if audioDir == "" {
 		var sessPath struct {
 			SessionPath struct {
@@ -283,22 +363,127 @@ func ptslImport(args []string) error {
 		// Pro Tools Developer 25.6 fails this call with an internal
 		// assertion; -dest avoids it.
 		if err := c.Call(ctx, ptsl.CmdGetSessionPath, nil, &sessPath); err != nil {
-			return fmt.Errorf(`asking Pro Tools for the session folder (pass -dest "<session>/Audio Files" instead): %w`, err)
+			return nil, fmt.Errorf(`asking Pro Tools for the session folder (pass -dest "<session>/Audio Files" instead): %w`, err)
 		}
 		audioDir = filepath.Join(filepath.Dir(sessPath.SessionPath.Path), "Audio Files")
 	}
+	var lines []string
 	for _, d := range rep.Deliverables {
-		abs, err := filepath.Abs(filepath.Join(*dir, d.File))
+		abs, err := filepath.Abs(filepath.Join(dir, d.File))
 		if err != nil {
-			return err
+			return lines, err
 		}
-		pos := d.SessionOffset // PTSL positions are relative to the session start
+		pos := d.TimeReference - s.StartSample // PTSL positions are relative to the session start
+		if pos < 0 {
+			return lines, fmt.Errorf("%s starts at timeline %d, before this session's start %s", d.File, d.TimeReference, s.StartTimecode)
+		}
 		if err := c.ImportSpotted(ctx, []string{abs}, audioDir, pos); err != nil {
-			return fmt.Errorf("importing %s: %w", d.File, err)
+			return lines, fmt.Errorf("importing %s: %w", d.File, err)
 		}
-		fmt.Printf("imported %s at session +%d samples (timeline %d)\n", d.File, pos, d.TimeReference)
+		lines = append(lines, fmt.Sprintf("imported %s at session +%d samples (timeline %d)", d.File, pos, d.TimeReference))
+	}
+	return lines, nil
+}
+
+// sendAddr adds the default port when addr has none.
+func sendAddr(addr string) string {
+	if _, _, err := net.SplitHostPort(addr); err != nil {
+		return net.JoinHostPort(addr, strconv.Itoa(xfer.DefaultPort))
+	}
+	return addr
+}
+
+func tokenOr(flagVal string) string {
+	if flagVal != "" {
+		return flagVal
+	}
+	return os.Getenv("RS_TOKEN")
+}
+
+func logStderr(format string, a ...any) {
+	fmt.Fprintf(os.Stderr, "%s %s\n", time.Now().Format("15:04:05"), fmt.Sprintf(format, a...))
+}
+
+func sendCmd(args []string) error {
+	fs := flag.NewFlagSet("send", flag.ExitOnError)
+	dir := fs.String("dir", "", "take directory")
+	to := fs.String("to", "", fmt.Sprintf("receiver host[:port] (default port %d)", xfer.DefaultPort))
+	token := fs.String("token", "", "shared token (default $RS_TOKEN)")
+	fs.Parse(args)
+	if *dir == "" || *to == "" {
+		return errors.New("send: -dir and -to are required")
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	s := &xfer.Sender{Dir: *dir, Addr: sendAddr(*to), Token: tokenOr(*token), Logf: logStderr}
+	return reportSend(s.Run(ctx))
+}
+
+func reportSend(res *xfer.Result, err error) error {
+	if err != nil {
+		return err
+	}
+	logStderr("send: receiver has a verified copy in %q", res.Dir)
+	if res.Summary != "" {
+		fmt.Fprintln(os.Stderr, res.Summary)
+	}
+	if res.Error != "" {
+		return fmt.Errorf("receiver could not finish processing the take: %s", res.Error)
 	}
 	return nil
+}
+
+func receiveCmd(args []string) error {
+	fs := flag.NewFlagSet("receive", flag.ExitOnError)
+	listen := fs.String("listen", fmt.Sprintf(":%d", xfer.DefaultPort), "address to listen on")
+	dir := fs.String("dir", "", "folder to receive takes into")
+	token := fs.String("token", "", "shared token senders must present (default $RS_TOKEN)")
+	doDeliver := fs.Bool("deliver", false, "render placed BWF files when a take arrives")
+	doImport := fs.Bool("import", false, "also import them into the open Pro Tools session (implies -deliver)")
+	addr := fs.String("ptsl-addr", ptsl.DefaultAddress, "PTSL address (with -import)")
+	dest := fs.String("dest", "", `with -import: folder to copy audio into (default: the session's "Audio Files")`)
+	fs.Parse(args)
+	if *dir == "" {
+		return errors.New("receive: -dir is required")
+	}
+	tok := tokenOr(*token)
+	if tok == "" {
+		logStderr("receive: no -token set; any sender that can reach this port can send takes")
+	}
+	rv := &xfer.Receiver{Root: *dir, Token: tok, Logf: logStderr}
+	if *doDeliver || *doImport {
+		rv.OnComplete = func(ctx context.Context, dir string) (string, error) {
+			rep, err := deliver.Render(ctx, dir, deliver.Options{Codec: "pcm_s24le", Renderer: siblingTool("rs-render")})
+			if err != nil {
+				return "", fmt.Errorf("deliver: %w", err)
+			}
+			var lines []string
+			for _, w := range rep.Warnings {
+				lines = append(lines, "warning: "+w)
+			}
+			for _, d := range rep.Deliverables {
+				lines = append(lines, fmt.Sprintf("delivered %s at timeline %d (%d frames)", d.File, d.TimeReference, d.Segment.Frames))
+			}
+			if *doImport {
+				imp, err := importTake(ctx, dir, *addr, *dest)
+				lines = append(lines, imp...)
+				if err != nil {
+					return strings.Join(lines, "\n"), fmt.Errorf("import: %w", err)
+				}
+			}
+			s := strings.Join(lines, "\n")
+			logStderr("receive: %s\n%s", filepath.Base(dir), s)
+			return s, nil
+		}
+	}
+	ln, err := net.Listen("tcp", *listen)
+	if err != nil {
+		return err
+	}
+	logStderr("receive: listening on %s, takes go to %s", ln.Addr(), *dir)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return rv.Serve(ctx, ln)
 }
 
 // siblingTool finds a helper binary next to this executable, falling back
