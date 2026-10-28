@@ -206,7 +206,13 @@ flags, through a memory-mapped ring (`native/link/LinkShared.h`).
   with marked silence, then cut out of deliverables as a visible gap.
 - `rsession record -link` turns the stream into a take whose transport events
   carry exact master frames, replacing PTSL polling.
-- It is built as a universal binary because Pro Tools 2026.4 runs under Rosetta.
+- It is built as a universal binary: Pro Tools 2026.4 runs under Rosetta,
+  the 2025.6 Developer build is native arm64.
+- Link files live in `~/Library/Application Support/AntiMusic/RemoteSession/links`
+  on both sides (until 2026-10-27 the plugin wrote to `~/Library/AntiMusic`,
+  so `rsession` never found it outside tests).
+- `rsession links -watch <track>` prints live state changes, position jumps,
+  and the exact timeline sample of each onset.
 
 Evidence:
 
@@ -215,18 +221,38 @@ Evidence:
 - A scripted take with start, stop, locate, a loop jump, and a 36-block
   overrun delivered sample-exact placements.
 
-**Unverified:** whether the position Pro Tools reports to an AAX insert accounts
-for delay compensation upstream of the insert. This needs the plugin running
-in Pro Tools.
+Verified in Pro Tools Developer 25.6.0.11 (arm64), 2026-10-27, AAX unsigned,
+48 kHz session started at 00:00:00:00, stereo track "Click", 128-sample blocks:
+
+- **Load:** retail Pro Tools 25.12.1 rejects the unsigned AAX
+  (`did NOT get valid dsig`, err -7054); the Developer build loads it.
+- **Track name:** reported ("Click").
+- **Position:** a one-sample click spotted at sample 96000 was reported at
+  timeline 96000, so the position is samples from session start and exact.
+- **Delay compensation:** with a pitch plugin upstream of Link (session
+  system delay 4213 samples, compensation on), the click was reported at
+  96007, not about 100213. Pro Tools reports positions already compensated
+  for upstream latency; the recorder needs no correction. The 7 samples are
+  most likely the pitch plugin smearing the transient; repeat with a plain
+  latency plugin to confirm.
+- **Play start:** the first playing block starts before the cursor (by -27
+  to -124 samples, or about the system delay when compensation is
+  active) and advances contiguously from there. The recorder must not treat
+  negative positions as errors.
+- **Stop:** the position jumps back to the play start and holds still.
+- **While stopped:** on an armed track, blocks keep arriving at the cursor
+  position with the playing flag off. On an empty, unarmed track Pro Tools
+  does not call the plugin at all (Dynamic Plug-In Processing), so Link
+  publishes nothing. Recording tracks are armed, so this is fine for capture;
+  it matters if Link is ever used on playback-only tracks.
+- Not yet tested: delay compensation off, loop playback, and a full
+  `record -link` → deliver → `ptsl-import` round trip in Pro Tools.
 
 ## Blockers and risks
 
-1. **The Link AAX is built but unsigned.** Retail Pro Tools does not load
-   unsigned AAX plugins. Needed from the owner: PACE signing tools and an iLok
-   developer account, or a Pro Tools Developer build. Once it loads, verify:
-   - position semantics under delay compensation;
-   - behaviour while stopped;
-   - track-name reporting.
+1. **The Link AAX is unsigned.** It loads and is verified in the Pro Tools
+   Developer build (section 7). Retail Pro Tools rejects it until it is
+   signed with PACE tools (request via audiosdk@avid.com).
 2. **Capture-path latency** (`latency_frames`) is configurable but not yet
    measured per interface. It needs a round-trip measurement with the real
    interface, and `GetSessionSystemDelayInfo` is available to help.
