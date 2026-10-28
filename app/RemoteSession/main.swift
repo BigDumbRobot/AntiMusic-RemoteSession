@@ -453,81 +453,71 @@ final class Client: ObservableObject {
     }
 }
 
-// MARK: - Vaporwave look
+// MARK: - Look: calm and dark, with a nod to vaporwave
 
 enum Neon {
-    static let pink = Color(red: 1.0, green: 0.16, blue: 0.43)
-    static let cyan = Color(red: 0.02, green: 0.85, blue: 0.91)
-    static let purple = Color(red: 0.55, green: 0.24, blue: 0.95)
-    static let yellow = Color(red: 1.0, green: 0.84, blue: 0.29)
-    static let ice = Color(red: 0.82, green: 0.97, blue: 1.0)
-    static let panel = Color(red: 0.06, green: 0.0, blue: 0.14).opacity(0.72)
+    static let pink = Color(red: 1.0, green: 0.36, blue: 0.62)
+    static let cyan = Color(red: 0.35, green: 0.85, blue: 0.92)
+    static let purple = Color(red: 0.62, green: 0.5, blue: 0.95)
+    static let yellow = Color(red: 1.0, green: 0.8, blue: 0.45)
+    static let ice = Color(red: 0.92, green: 0.9, blue: 0.97)
+    static let dim = Color(red: 0.62, green: 0.58, blue: 0.7)
+    static let panel = Color(red: 0.12, green: 0.1, blue: 0.16)
+    static let line = Color.white.opacity(0.08)
+    static let sunset = LinearGradient(colors: [pink, purple, cyan], startPoint: .leading, endPoint: .trailing)
 }
 
+/// The striped retro sun, small, as the app's mark.
 struct SunView: View {
     var body: some View {
         Canvas { ctx, size in
             let r = CGRect(origin: .zero, size: size)
             ctx.clip(to: Path(ellipseIn: r))
-            ctx.fill(Path(r), with: .linearGradient(
-                Gradient(colors: [Neon.yellow, Color(red: 1, green: 0.45, blue: 0.3), Neon.pink]),
-                startPoint: .zero, endPoint: CGPoint(x: 0, y: size.height)))
-            // The classic stripes, thicker toward the bottom.
-            var y = size.height * 0.52
-            var gap: CGFloat = 3
+            ctx.fill(Path(r), with: .linearGradient(Gradient(colors: [Neon.yellow, Neon.pink]),
+                                                     startPoint: .zero, endPoint: CGPoint(x: 0, y: size.height)))
+            var y = size.height * 0.5
+            var gap = size.height * 0.04
             while y < size.height {
                 ctx.blendMode = .destinationOut
                 ctx.fill(Path(CGRect(x: 0, y: y, width: size.width, height: gap)), with: .color(.black))
-                y += gap + 9
-                gap += 2.2
+                y += gap + size.height * 0.1
+                gap += size.height * 0.02
             }
         }
         .compositingGroup()
-        .shadow(color: Neon.pink.opacity(0.8), radius: 40)
     }
 }
 
+/// A faint perspective grid fading in at the bottom of the window.
 struct GridView: View {
     var body: some View {
         Canvas { ctx, size in
-            let horizon = size.height * 0.62
-            ctx.fill(Path(CGRect(x: 0, y: horizon, width: size.width, height: size.height - horizon)),
-                     with: .linearGradient(Gradient(colors: [Color(red: 0.12, green: 0, blue: 0.22), Color(red: 0.03, green: 0, blue: 0.08)]),
-                                           startPoint: CGPoint(x: 0, y: horizon), endPoint: CGPoint(x: 0, y: size.height)))
+            let horizon = size.height * 0.72
             var lines = Path()
-            // Horizontal lines, closer together near the horizon.
-            for i in 1...14 {
-                let t = pow(CGFloat(i) / 14, 2.2)
-                let y = horizon + (size.height - horizon) * t
+            for i in 1...10 {
+                let y = horizon + (size.height - horizon) * pow(CGFloat(i) / 10, 2.2)
                 lines.move(to: CGPoint(x: 0, y: y))
                 lines.addLine(to: CGPoint(x: size.width, y: y))
             }
-            // Lines running to the vanishing point.
             let vx = size.width / 2
-            for i in -12...12 {
-                let x = vx + CGFloat(i) * size.width / 9
-                lines.move(to: CGPoint(x: vx + CGFloat(i) * 6, y: horizon))
-                lines.addLine(to: CGPoint(x: x, y: size.height))
+            for i in -10...10 {
+                lines.move(to: CGPoint(x: vx + CGFloat(i) * 5, y: horizon))
+                lines.addLine(to: CGPoint(x: vx + CGFloat(i) * size.width / 8, y: size.height))
             }
-            ctx.addFilter(.shadow(color: Neon.pink, radius: 4))
-            ctx.stroke(lines, with: .color(Neon.pink.opacity(0.85)), lineWidth: 1.2)
-            ctx.stroke(Path(CGRect(x: 0, y: horizon, width: size.width, height: 0.5)), with: .color(Neon.cyan), lineWidth: 2)
+            ctx.stroke(lines, with: .linearGradient(Gradient(colors: [Neon.pink.opacity(0), Neon.pink.opacity(0.16)]),
+                                                     startPoint: CGPoint(x: 0, y: horizon), endPoint: CGPoint(x: 0, y: size.height)),
+                       lineWidth: 1)
         }
+        .allowsHitTesting(false)
     }
 }
 
 struct VaporBackground: View {
     var body: some View {
-        GeometryReader { g in
-            ZStack {
-                LinearGradient(colors: [Color(red: 0.05, green: 0.0, blue: 0.13), Color(red: 0.2, green: 0.03, blue: 0.36),
-                                        Color(red: 0.45, green: 0.07, blue: 0.47), Color(red: 0.85, green: 0.2, blue: 0.5)],
-                               startPoint: .top, endPoint: UnitPoint(x: 0.5, y: 0.62))
-                SunView()
-                    .frame(width: g.size.width * 0.5, height: g.size.width * 0.5)
-                    .position(x: g.size.width / 2, y: g.size.height * 0.62 - g.size.width * 0.16)
-                GridView()
-            }
+        ZStack {
+            LinearGradient(colors: [Color(red: 0.07, green: 0.06, blue: 0.1), Color(red: 0.1, green: 0.07, blue: 0.14)],
+                           startPoint: .top, endPoint: .bottom)
+            GridView()
         }
         .ignoresSafeArea()
     }
@@ -536,14 +526,13 @@ struct VaporBackground: View {
 struct ChromeTitle: View {
     let text: String
     var body: some View {
-        Text(text)
-            .font(.custom("Futura-CondensedExtraBold", size: 46))
-            .kerning(3)
-            .foregroundStyle(LinearGradient(colors: [Neon.ice, .white, Neon.cyan, Neon.purple, Neon.pink],
-                                            startPoint: .top, endPoint: .bottom))
-            .shadow(color: Neon.pink, radius: 0, x: 3, y: 3)
-            .shadow(color: Neon.cyan.opacity(0.8), radius: 14)
-            .transformEffect(CGAffineTransform(a: 1, b: 0, c: -0.18, d: 1, tx: 8, ty: 0)) // italic slant
+        VStack(spacing: 6) {
+            HStack(spacing: 10) {
+                SunView().frame(width: 26, height: 26)
+                Text(text).font(.system(size: 24, weight: .semibold)).foregroundColor(Neon.ice)
+            }
+            Rectangle().fill(Neon.sunset).frame(width: 160, height: 2).cornerRadius(1)
+        }
     }
 }
 
@@ -562,17 +551,12 @@ struct NeonButtonBody: View {
     @Environment(\.isEnabled) private var enabled
     var body: some View {
         configuration.label
-            .font(.system(size: 14, weight: .heavy, design: .rounded))
-            .textCase(.uppercase)
-            .kerning(1.2)
-            .padding(.vertical, 9).padding(.horizontal, 16)
-            .foregroundColor(filled ? Color(red: 0.08, green: 0, blue: 0.15) : color)
-            .background(RoundedRectangle(cornerRadius: 8).fill(filled ? color : Color.black.opacity(0.35)))
-            .overlay(RoundedRectangle(cornerRadius: 8).stroke(color, lineWidth: 2))
-            .shadow(color: color.opacity(configuration.isPressed ? 1 : 0.7), radius: configuration.isPressed ? 14 : 8)
-            .scaleEffect(configuration.isPressed ? 0.97 : 1)
-            .opacity(enabled ? 1 : 0.35)
-            .saturation(enabled ? 1 : 0.3)
+            .font(.system(size: 13, weight: .semibold))
+            .padding(.vertical, 7).padding(.horizontal, 14)
+            .foregroundColor(filled ? Color(red: 0.1, green: 0.05, blue: 0.12) : color)
+            .background(RoundedRectangle(cornerRadius: 7).fill(filled ? color : Color.white.opacity(0.04)))
+            .overlay(RoundedRectangle(cornerRadius: 7).stroke(filled ? .clear : color.opacity(0.55), lineWidth: 1))
+            .opacity(configuration.isPressed ? 0.75 : (enabled ? 1 : 0.35))
     }
 }
 
@@ -582,18 +566,15 @@ struct Panel<Content: View>: View {
     @ViewBuilder var content: Content
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text(title)
-                .font(.system(size: 12, weight: .heavy, design: .monospaced))
-                .kerning(2.5)
-                .foregroundColor(accent)
-                .shadow(color: accent, radius: 6)
+            Text(title.capitalized)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(Neon.dim)
             content
         }
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(RoundedRectangle(cornerRadius: 14).fill(Neon.panel))
-        .overlay(RoundedRectangle(cornerRadius: 14).stroke(accent.opacity(0.65), lineWidth: 1.5))
-        .shadow(color: accent.opacity(0.35), radius: 12)
+        .background(RoundedRectangle(cornerRadius: 12).fill(Neon.panel))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Neon.line, lineWidth: 1))
     }
 }
 
@@ -602,7 +583,7 @@ struct GlowText: View {
     var color: Color = Neon.ice
     var size: CGFloat = 13
     var body: some View {
-        Text(text).font(.system(size: size, weight: .semibold, design: .rounded))
+        Text(text).font(.system(size: size))
             .foregroundColor(color).fixedSize(horizontal: false, vertical: true)
     }
 }
@@ -614,13 +595,13 @@ struct NeonField: View {
     var mono = false
     var onSubmit: () -> Void = {}
     var body: some View {
-        TextField("", text: $text, prompt: Text(placeholder).foregroundColor(Neon.ice.opacity(0.4)))
+        TextField("", text: $text, prompt: Text(placeholder).foregroundColor(Neon.dim.opacity(0.7)))
             .textFieldStyle(.plain)
-            .font(.system(size: size, weight: .semibold, design: mono ? .monospaced : .rounded))
+            .font(.system(size: size, weight: mono ? .medium : .regular, design: mono ? .monospaced : .default))
             .foregroundColor(Neon.ice)
-            .padding(10)
-            .background(RoundedRectangle(cornerRadius: 8).fill(Color.black.opacity(0.45)))
-            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Neon.purple, lineWidth: 1.5))
+            .padding(9)
+            .background(RoundedRectangle(cornerRadius: 7).fill(Color.black.opacity(0.3)))
+            .overlay(RoundedRectangle(cornerRadius: 7).stroke(Neon.line, lineWidth: 1))
             .onSubmit(onSubmit)
     }
 }
@@ -639,16 +620,16 @@ struct ChatBox: View {
                             HStack {
                                 if l.mine { Spacer(minLength: 40) }
                                 Text(l.text)
-                                    .font(.system(size: 13, weight: .medium, design: .rounded))
-                                    .foregroundColor(l.mine ? Color(red: 0.08, green: 0, blue: 0.15) : Neon.ice)
+                                    .font(.system(size: 13))
+                                    .foregroundColor(l.mine ? Color(red: 0.1, green: 0.05, blue: 0.12) : Neon.ice)
                                     .padding(.vertical, 6).padding(.horizontal, 10)
-                                    .background(RoundedRectangle(cornerRadius: 10).fill(l.mine ? Neon.cyan : Neon.purple.opacity(0.55)))
+                                    .background(RoundedRectangle(cornerRadius: 10).fill(l.mine ? Neon.cyan.opacity(0.9) : Color.white.opacity(0.08)))
                                 if !l.mine { Spacer(minLength: 40) }
                             }.id(l.id)
                         }
                     }
                 }
-                .frame(height: 120)
+                .frame(height: 110)
                 .onChange(of: lines.count) { _ in if let last = lines.last { proxy.scrollTo(last.id) } }
             }
             HStack {
@@ -664,7 +645,7 @@ struct ChatBox: View {
 struct StatusDot: View {
     let color: Color
     var body: some View {
-        Circle().fill(color).frame(width: 10, height: 10).shadow(color: color, radius: 6)
+        Circle().fill(color).frame(width: 8, height: 8)
     }
 }
 
@@ -695,21 +676,16 @@ struct StudioView: View {
     var body: some View {
         VStack(spacing: 14) {
             VStack(spacing: 12) {
-                Text("YOUR STUDIO CODE")
-                    .font(.system(size: 13, weight: .heavy, design: .monospaced)).kerning(4)
-                    .foregroundColor(Neon.pink).shadow(color: Neon.pink, radius: 6)
-                Text(studio.code ?? "GETTING ONLINE…")
-                    .font(.system(size: studio.code == nil ? 22 : 40, weight: .heavy, design: .monospaced))
-                    .foregroundColor(Neon.cyan)
-                    .shadow(color: Neon.pink.opacity(0.9), radius: 0, x: 2, y: 2)
-                    .shadow(color: Neon.cyan, radius: 12)
+                Text("Your studio code")
+                    .font(.system(size: 13, weight: .medium)).foregroundColor(Neon.dim)
+                Text(studio.code ?? "Getting online…")
+                    .font(.system(size: studio.code == nil ? 20 : 36, weight: .semibold, design: .monospaced))
+                    .foregroundColor(Neon.ice)
                     .textSelection(.enabled)
-                    .padding(.vertical, 16)
+                    .padding(.vertical, 18)
                     .frame(maxWidth: .infinity)
-                    .background(RoundedRectangle(cornerRadius: 14).fill(Color.black.opacity(0.55)))
-                    .overlay(RoundedRectangle(cornerRadius: 14).stroke(
-                        LinearGradient(colors: [Neon.cyan, Neon.purple, Neon.pink], startPoint: .leading, endPoint: .trailing), lineWidth: 2.5))
-                    .shadow(color: Neon.purple.opacity(0.8), radius: 18)
+                    .background(RoundedRectangle(cornerRadius: 12).fill(Neon.panel))
+                    .overlay(RoundedRectangle(cornerRadius: 12).stroke(Neon.sunset, lineWidth: 1.5))
                 HStack(spacing: 14) {
                     Button { copyToClipboard(studio.code ?? ""); copied = "Code copied · paste it into a message" } label: {
                         Label("Copy code", systemImage: "doc.on.doc")
@@ -718,12 +694,12 @@ struct StudioView: View {
                         Label("Copy invite", systemImage: "envelope")
                     }.buttonStyle(NeonButton(color: Neon.cyan))
                 }.disabled(studio.code == nil)
-                GlowText(text: copied, color: Neon.yellow, size: 12).frame(height: 14)
+                GlowText(text: copied, color: Neon.dim, size: 12).frame(height: 14)
                 HStack(alignment: .top, spacing: 8) {
                     StatusDot(color: dot).padding(.top, 3)
                     VStack(alignment: .leading, spacing: 3) {
                         GlowText(text: studio.problem ?? statusTitle, color: .white)
-                        if studio.problem == nil && !studio.detail.isEmpty { GlowText(text: studio.detail, color: Neon.ice.opacity(0.7), size: 11) }
+                        if studio.problem == nil && !studio.detail.isEmpty { GlowText(text: studio.detail, color: Neon.dim, size: 11) }
                     }
                     Spacer()
                     if studio.problem != nil { Button("Try again") { studio.restart() }.buttonStyle(NeonButton(color: Neon.yellow)) }
@@ -736,8 +712,7 @@ struct StudioView: View {
                     GlowText(text: studio.client.map { "\($0) is in your session" } ?? "Waiting for a client to join…", color: .white)
                     Spacer()
                     Text(timeString(studio.elapsed))
-                        .font(.system(size: 18, weight: .heavy, design: .monospaced)).foregroundColor(Neon.yellow)
-                        .shadow(color: Neon.yellow, radius: 6)
+                        .font(.system(size: 16, weight: .medium, design: .monospaced)).foregroundColor(Neon.ice)
                     Button(studio.timerRunning ? "Pause" : "Start clock") { studio.toggleTimer() }
                         .buttonStyle(NeonButton(color: Neon.yellow))
                 }
@@ -757,20 +732,20 @@ struct StudioView: View {
 
             Panel(title: "INCOMING", accent: Neon.cyan) {
                 if studio.takes.isEmpty {
-                    GlowText(text: "Stems and takes from your client land here and in your session.", color: Neon.ice.opacity(0.7), size: 12)
+                    GlowText(text: "Stems and takes from your client land here and in your session.", color: Neon.dim, size: 12)
                 } else {
                     ForEach(studio.takes.prefix(4)) { t in
                         HStack {
                             Text(t.id).font(.system(size: 12, weight: .semibold, design: .monospaced)).foregroundColor(Neon.ice)
                             Spacer()
-                            GlowText(text: t.state, color: t.state.hasPrefix("Receiving") ? Neon.cyan : Neon.ice.opacity(0.7), size: 12)
+                            GlowText(text: t.state, color: t.state.hasPrefix("Receiving") ? Neon.cyan : Neon.dim, size: 12)
                         }
                         if !t.detail.isEmpty { GlowText(text: t.detail, color: Neon.yellow, size: 11) }
                     }
                 }
                 HStack {
                     Toggle("Import into the open Pro Tools session", isOn: $studio.importIntoProTools)
-                        .toggleStyle(.switch).tint(Neon.pink).foregroundColor(Neon.ice)
+                        .toggleStyle(.switch).tint(Neon.pink).foregroundColor(Neon.dim)
                     Spacer()
                     Button("Show in Finder") { NSWorkspace.shared.open(studio.folder) }.buttonStyle(NeonButton(color: Neon.purple))
                 }
@@ -814,7 +789,7 @@ struct JoinView: View {
                     GlowText(text: client.studio.map { "In session with \($0)" } ?? (client.status.isEmpty ? "Not connected" : client.status), color: .white)
                     Spacer()
                     Toggle("Import prints into Pro Tools", isOn: $client.importIntoProTools)
-                        .toggleStyle(.switch).tint(Neon.pink).foregroundColor(Neon.ice).disabled(client.joined)
+                        .toggleStyle(.switch).tint(Neon.pink).foregroundColor(Neon.dim).disabled(client.joined)
                 }
             }
 
@@ -828,19 +803,19 @@ struct JoinView: View {
                     Spacer()
                 }
                 if !client.stemsStatus.isEmpty { GlowText(text: client.stemsStatus, color: Neon.yellow, size: 12) }
-                GlowText(text: "Stems are placed from the start of your song. Bounce them from the session start.", color: Neon.ice.opacity(0.6), size: 11)
+                GlowText(text: "Stems are placed from the start of your song. Bounce them from the session start.", color: Neon.dim, size: 11)
                 ChatBox(lines: client.chat, enabled: client.studio != nil) { client.say($0) }
             }
 
             Panel(title: "PRINTS BACK", accent: Neon.pink) {
                 if client.prints.isEmpty {
-                    GlowText(text: "Prints from the engineer land in your session at the same spot as your stems.", color: Neon.ice.opacity(0.7), size: 12)
+                    GlowText(text: "Prints from the engineer land in your session at the same spot as your stems.", color: Neon.dim, size: 12)
                 } else {
                     ForEach(client.prints.prefix(4)) { t in
                         HStack {
                             Text(t.id).font(.system(size: 12, weight: .semibold, design: .monospaced)).foregroundColor(Neon.ice)
                             Spacer()
-                            GlowText(text: t.state, color: t.state.hasPrefix("Receiving") ? Neon.cyan : Neon.ice.opacity(0.7), size: 12)
+                            GlowText(text: t.state, color: t.state.hasPrefix("Receiving") ? Neon.cyan : Neon.dim, size: 12)
                         }
                         if !t.detail.isEmpty { GlowText(text: t.detail, color: Neon.yellow, size: 11) }
                     }
@@ -865,7 +840,7 @@ struct JoinView: View {
                 }
                 GlowText(text: client.recordStatus.isEmpty
                          ? "Any DAW: put the RemoteSession Link plugin on a track. Pro Tools can also use Audio Bridge."
-                         : client.recordStatus, color: client.recordStatus.isEmpty ? Neon.ice.opacity(0.6) : Neon.yellow, size: 11)
+                         : client.recordStatus, color: client.recordStatus.isEmpty ? Neon.dim : Neon.yellow, size: 11)
             }
         }
         .onAppear { client.refreshSources() }
@@ -884,13 +859,14 @@ struct RootView: View {
             VaporBackground()
             ScrollView {
                 VStack(spacing: 16) {
-                    ChromeTitle(text: "REMOTE SESSION").padding(.top, 30)
+                    ChromeTitle(text: "RemoteSession").padding(.top, 34)
                     HStack(spacing: 0) {
-                        tabButton("STUDIO", 0)
-                        tabButton("JOIN A STUDIO", 1)
+                        tabButton("Studio", 0)
+                        tabButton("Join a studio", 1)
                     }
-                    .background(RoundedRectangle(cornerRadius: 10).fill(Color.black.opacity(0.45)))
-                    .overlay(RoundedRectangle(cornerRadius: 10).stroke(Neon.purple, lineWidth: 1.5))
+                    .padding(3)
+                    .background(RoundedRectangle(cornerRadius: 9).fill(Neon.panel))
+                    .overlay(RoundedRectangle(cornerRadius: 9).stroke(Neon.line, lineWidth: 1))
                     if tab == 0 { StudioView(studio: studio) } else { JoinView(client: client) }
                 }
                 .padding(.horizontal, 28).padding(.bottom, 28)
@@ -903,11 +879,10 @@ struct RootView: View {
     func tabButton(_ title: String, _ i: Int) -> some View {
         Button { tab = i } label: {
             Text(title)
-                .font(.system(size: 13, weight: .heavy, design: .monospaced)).kerning(2)
-                .foregroundColor(tab == i ? Color(red: 0.08, green: 0, blue: 0.15) : Neon.ice)
-                .padding(.vertical, 9).padding(.horizontal, 22)
-                .background(RoundedRectangle(cornerRadius: 9).fill(tab == i ? Neon.cyan : .clear))
-                .shadow(color: tab == i ? Neon.cyan : .clear, radius: 10)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundColor(tab == i ? Neon.ice : Neon.dim)
+                .padding(.vertical, 6).padding(.horizontal, 18)
+                .background(RoundedRectangle(cornerRadius: 7).fill(tab == i ? Color.white.opacity(0.1) : .clear))
         }.buttonStyle(.plain)
     }
 }
