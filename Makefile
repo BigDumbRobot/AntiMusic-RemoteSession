@@ -1,6 +1,8 @@
-.PHONY: all go native test clean
+.PHONY: all go native test clean relay-linux
 
 JUCE_DIR ?=
+# Relay built into rsession, e.g. make RELAY=relay.example.com:7401
+RELAY ?=
 CMAKE_JUCE := $(if $(JUCE_DIR),-DFETCHCONTENT_SOURCE_DIR_JUCE=$(JUCE_DIR),)
 
 all: bin/rs-capture go native
@@ -10,7 +12,11 @@ bin/rs-capture: native/capture/rs-capture.c
 	clang -O2 -Wall -Wextra -std=c11 -framework CoreAudio -framework CoreFoundation -o $@ $<
 
 go:
-	go build -o bin/ ./cmd/...
+	go build -ldflags "-X main.defaultRelay=$(RELAY)" -o bin/ ./cmd/...
+
+# Relay server for a Linux host (amd64; set GOARCH=arm64 for ARM servers).
+relay-linux:
+	GOOS=linux GOARCH=$${GOARCH:-amd64} CGO_ENABLED=0 go build -o bin/linux/rs-relay ./cmd/rs-relay
 
 # JUCE parts: rs-render (plugin host) and the RemoteSession Link plugin.
 native:

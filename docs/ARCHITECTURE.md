@@ -260,6 +260,36 @@ Verified in Pro Tools Developer 25.6.0.11 (arm64), 2026-10-27, AAX unsigned,
   avoids the call.
 - Not yet tested: delay compensation off, loop playback.
 
+### 8. Takes travel to the studio through a relay, by pairing code
+
+The home machine records locally (the master never depends on the network)
+and `internal/xfer` copies the take directory to the studio while it is
+recorded: file growth is shipped every 200 ms; when the take is finished,
+1 MiB block hashes are compared and differences resent (FFmpeg rewrites the
+CAF header on close) until the copies are byte-identical. A dropped link
+reconnects and resumes from the sizes the receiver reports.
+
+Both sides connect out to `rs-relay` (`internal/pair`), so there is no VPN,
+port forwarding or account. The studio's pairing code (`XXXX-XXXX-XXXX`,
+saved in `~/Library/Application Support/AntiMusic/RemoteSession/pairing-code`)
+has a 4-character rendezvous ID the relay sees and an 8-character secret it
+never sees. The ends run an X25519 handshake keyed by Argon2id(secret)
+(64 MiB, 2 passes) with HMAC key confirmation, then AES-256-GCM per
+direction. A relay operator who records a handshake can only test guesses
+of the 40-bit secret at Argon2 cost; a wrong code fails at once
+(`ErrBadCode`, not retried).
+
+Evidence (2026-10-28, one Mac): tests cover pairing, ciphertext-only on the
+relay, wrong code, studio offline, studio re-registering after a relay
+restart, and a take resumed after a dropped link, 30 runs clean under the
+race detector. A Link recording sent by code through a local `rs-relay`
+arrived byte-identical and was delivered and imported into Pro Tools
+Developer 25.6 automatically.
+
+Open: no deployed relay yet (`make RELAY=host:port` builds its address in);
+no direct peer-to-peer path, so all traffic crosses the relay; no rate
+limiting on the relay.
+
 ## Blockers and risks
 
 1. **The Link AAX is unsigned.** It loads and is verified in the Pro Tools

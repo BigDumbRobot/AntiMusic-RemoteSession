@@ -166,7 +166,11 @@ func (e *PeerError) Error() string { return "receiver: " + e.Msg }
 // IsFatal reports whether err means retrying cannot succeed.
 func IsFatal(err error) bool {
 	var pe *PeerError
-	return errors.As(err, &pe) && pe.Fatal
+	if errors.As(err, &pe) {
+		return pe.Fatal
+	}
+	var f interface{ Fatal() bool }
+	return errors.As(err, &f) && f.Fatal()
 }
 
 // data payload: [name len u16][name][offset u64][bytes]

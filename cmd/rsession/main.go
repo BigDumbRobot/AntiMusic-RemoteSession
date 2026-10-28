@@ -21,6 +21,7 @@ import (
 
 	"antimusic.dev/remotesession/internal/deliver"
 	"antimusic.dev/remotesession/internal/link"
+	"antimusic.dev/remotesession/internal/pair"
 	"antimusic.dev/remotesession/internal/ptsl"
 	"antimusic.dev/remotesession/internal/recorder"
 	"antimusic.dev/remotesession/internal/take"
@@ -94,7 +95,9 @@ func record(args []string) error {
 	rate := fs.Int("session-rate", 0, "session sample rate (without -ptsl)")
 	start := fs.String("session-start", "00:00:00:00", "session start timecode (without -ptsl)")
 	fps := fs.String("fps", "25", "timecode rate for -session-start: 23.976 24 25 29.97 29.97df 30 50 59.94 59.94df 60")
-	sendTo := fs.String("send", "", fmt.Sprintf("also copy the take live to a receiver at host[:port] (default port %d)", xfer.DefaultPort))
+	code := fs.String("code", "", "also copy the take live to the studio with this pairing code")
+	relay := fs.String("relay", "", "relay host[:port] for -code (default $RS_RELAY, or the built-in relay)")
+	sendTo := fs.String("send", "", fmt.Sprintf("instead of -code: copy directly to a receiver at host[:port] (default port %d)", xfer.DefaultPort))
 	token := fs.String("token", "", "with -send: shared token (default $RS_TOKEN)")
 	fs.Parse(args)
 	if (*device == "") == (*linkSel == "") || *dir == "" {
@@ -103,10 +106,14 @@ func record(args []string) error {
 	if _, err := os.Stat(*dir); err == nil {
 		return fmt.Errorf("record: %s already exists; pick a new take directory", *dir)
 	}
-	if *sendTo == "" {
+	if *sendTo == "" && *code == "" {
 		return recordTake(*dir, *device, *linkSel, *latency, *codec, *usePTSL, *addr, *poll, *rate, *start, *fps)
 	}
 
+	s, resume, err := newSender(*dir, *code, *relay, *sendTo, *token)
+	if err != nil {
+		return err
+	}
 	// The upload runs beside the recording and never blocks it. It
 	// starts once the recorder has written the take's manifest.
 	sctx, scancel := context.WithCancel(context.Background())
@@ -127,14 +134,13 @@ func record(args []string) error {
 			case <-time.After(50 * time.Millisecond):
 			}
 		}
-		s := &xfer.Sender{Dir: *dir, Addr: sendAddr(*sendTo), Token: tokenOr(*token), Logf: logStderr}
 		res, serr = s.Run(sctx)
 	}()
 	rerr := recordTake(*dir, *device, *linkSel, *latency, *codec, *usePTSL, *addr, *poll, *rate, *start, *fps)
 	if _, err := os.Stat(filepath.Join(*dir, take.ManifestFile)); err != nil {
 		scancel() // the recording never started
 	} else {
-		logStderr("send: finishing the copy to %s (Ctrl-C to stop; resume later with: rsession send -dir %s -to %s)", *sendTo, *dir, *sendTo)
+		logStderr("send: finishing the copy (Ctrl-C to stop; resume later with: %s)", resume)
 	}
 	ictx, istop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	select {
@@ -385,6 +391,76 @@ func importTake(ctx context.Context, dir, addr, dest string) ([]string, error) {
 	return lines, nil
 }
 
+// defaultRelay is the relay built into this binary
+// (make RELAY=host:port sets it via -ldflags).
+var defaultRelay = ""
+
+// relayAddr picks the relay: flag, then $RS_RELAY, then the built-in one.
+func relayAddr(flagVal string) (string, error) {
+	r := flagVal
+	if r == "" {
+		r = os.Getenv("RS_RELAY")
+	}
+	if r == "" {
+		r = defaultRelay
+	}
+	if r == "" {
+		return "", errors.New("no relay configured: pass -relay host:port, set RS_RELAY, or build with make RELAY=host:port")
+	}
+	if _, _, err := net.SplitHostPort(r); err != nil {
+		r = net.JoinHostPort(r, strconv.Itoa(pair.DefaultRelayPort))
+	}
+	return r, nil
+}
+
+// newSender builds a sender for a pairing code (through the relay) or a
+// direct address. It also returns the command that resumes the upload.
+func newSender(dir, code, relay, to, token string) (*xfer.Sender, string, error) {
+	switch {
+	case code != "" && to != "":
+		return nil, "", errors.New("use either a pairing code or a direct address, not both")
+	case code != "":
+		c, err := pair.ParseCode(code)
+		if err != nil {
+			return nil, "", err
+		}
+		r, err := relayAddr(relay)
+		if err != nil {
+			return nil, "", err
+		}
+		s := &xfer.Sender{Dir: dir, Addr: "studio " + c.ID, Logf: logStderr,
+			Dial: func(ctx context.Context) (net.Conn, error) { return pair.Dial(ctx, r, c) }}
+		return s, fmt.Sprintf("rsession send -dir %s -code %s", dir, c), nil
+	case to != "":
+		s := &xfer.Sender{Dir: dir, Addr: sendAddr(to), Token: tokenOr(token), Logf: logStderr}
+		return s, fmt.Sprintf("rsession send -dir %s -to %s", dir, to), nil
+	}
+	return nil, "", errors.New("give the studio's pairing code with -code")
+}
+
+// pairingCodeFile holds this studio's code, so it stays the same.
+func pairingCodeFile() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, "Library", "Application Support", "AntiMusic", "RemoteSession", "pairing-code")
+}
+
+func studioCode(explicit string, fresh bool) (pair.Code, error) {
+	if explicit != "" {
+		return pair.ParseCode(explicit)
+	}
+	path := pairingCodeFile()
+	if !fresh {
+		if b, err := os.ReadFile(path); err == nil {
+			return pair.ParseCode(string(b))
+		}
+	}
+	c := pair.NewCode()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return c, err
+	}
+	return c, os.WriteFile(path, []byte(c.String()+"\n"), 0o600)
+}
+
 // sendAddr adds the default port when addr has none.
 func sendAddr(addr string) string {
 	if _, _, err := net.SplitHostPort(addr); err != nil {
@@ -407,19 +483,27 @@ func logStderr(format string, a ...any) {
 func sendCmd(args []string) error {
 	fs := flag.NewFlagSet("send", flag.ExitOnError)
 	dir := fs.String("dir", "", "take directory")
-	to := fs.String("to", "", fmt.Sprintf("receiver host[:port] (default port %d)", xfer.DefaultPort))
-	token := fs.String("token", "", "shared token (default $RS_TOKEN)")
+	code := fs.String("code", "", "the studio's pairing code")
+	relay := fs.String("relay", "", "relay host[:port] (default $RS_RELAY, or the built-in relay)")
+	to := fs.String("to", "", fmt.Sprintf("instead of -code: receiver host[:port] for a direct connection (default port %d)", xfer.DefaultPort))
+	token := fs.String("token", "", "with -to: shared token (default $RS_TOKEN)")
 	fs.Parse(args)
-	if *dir == "" || *to == "" {
-		return errors.New("send: -dir and -to are required")
+	if *dir == "" {
+		return errors.New("send: -dir is required")
+	}
+	s, _, err := newSender(*dir, *code, *relay, *to, *token)
+	if err != nil {
+		return err
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	s := &xfer.Sender{Dir: *dir, Addr: sendAddr(*to), Token: tokenOr(*token), Logf: logStderr}
 	return reportSend(s.Run(ctx))
 }
 
 func reportSend(res *xfer.Result, err error) error {
+	if errors.Is(err, context.Canceled) {
+		return errors.New("sending stopped before the studio had the whole take; run the same send command again to finish")
+	}
 	if err != nil {
 		return err
 	}
@@ -435,7 +519,10 @@ func reportSend(res *xfer.Result, err error) error {
 
 func receiveCmd(args []string) error {
 	fs := flag.NewFlagSet("receive", flag.ExitOnError)
-	listen := fs.String("listen", fmt.Sprintf(":%d", xfer.DefaultPort), "address to listen on")
+	relay := fs.String("relay", "", "relay host[:port] (default $RS_RELAY, or the built-in relay)")
+	codeFlag := fs.String("code", "", "use this pairing code instead of the studio's saved one")
+	newCode := fs.Bool("new-code", false, "replace the studio's saved pairing code (old code stops working)")
+	listen := fs.String("listen", "", fmt.Sprintf("instead of a relay: accept direct connections on this address (e.g. :%d)", xfer.DefaultPort))
 	dir := fs.String("dir", "", "folder to receive takes into")
 	token := fs.String("token", "", "shared token senders must present (default $RS_TOKEN)")
 	doDeliver := fs.Bool("deliver", false, "render placed BWF files when a take arrives")
@@ -447,7 +534,7 @@ func receiveCmd(args []string) error {
 		return errors.New("receive: -dir is required")
 	}
 	tok := tokenOr(*token)
-	if tok == "" {
+	if *listen != "" && tok == "" {
 		logStderr("receive: no -token set; any sender that can reach this port can send takes")
 	}
 	rv := &xfer.Receiver{Root: *dir, Token: tok, Logf: logStderr}
@@ -476,13 +563,33 @@ func receiveCmd(args []string) error {
 			return s, nil
 		}
 	}
-	ln, err := net.Listen("tcp", *listen)
-	if err != nil {
-		return err
-	}
-	logStderr("receive: listening on %s, takes go to %s", ln.Addr(), *dir)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	var ln net.Listener
+	if *listen != "" {
+		l, err := net.Listen("tcp", *listen)
+		if err != nil {
+			return err
+		}
+		ln = l
+		logStderr("receive: listening on %s, takes go to %s", ln.Addr(), *dir)
+	} else {
+		r, err := relayAddr(*relay)
+		if err != nil {
+			return err
+		}
+		code, err := studioCode(*codeFlag, *newCode)
+		if err != nil {
+			return err
+		}
+		l, err := pair.Listen(ctx, r, code, func(f string, a ...any) { logStderr("receive: "+f, a...) })
+		if err != nil {
+			return err
+		}
+		defer l.Close()
+		ln = l
+		fmt.Fprintf(os.Stderr, "\n    Pairing code:  %s\n\n    Give this to the musician. Takes go to %s\n\n", code, *dir)
+	}
 	return rv.Serve(ctx, ln)
 }
 

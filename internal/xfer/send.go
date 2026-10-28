@@ -17,8 +17,11 @@ import (
 
 // Sender ships one take directory to a receiver.
 type Sender struct {
-	Dir   string
-	Addr  string // host:port
+	Dir  string
+	Addr string // host:port, or a label for Dial in logs
+	// Dial, when set, replaces a direct TCP connection to Addr (e.g. a
+	// pairing-code connection through a relay).
+	Dial  func(ctx context.Context) (net.Conn, error)
 	Token string
 	Poll  time.Duration        // how often to look for new data (default 200 ms)
 	Logf  func(string, ...any) // progress and retry messages (optional)
@@ -95,8 +98,13 @@ func (s *Sender) session(ctx context.Context) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	d := net.Dialer{Timeout: 10 * time.Second, KeepAlive: 15 * time.Second}
-	raw, err := d.DialContext(ctx, "tcp", s.Addr)
+	var raw net.Conn
+	if s.Dial != nil {
+		raw, err = s.Dial(ctx)
+	} else {
+		d := net.Dialer{Timeout: 10 * time.Second, KeepAlive: 15 * time.Second}
+		raw, err = d.DialContext(ctx, "tcp", s.Addr)
+	}
 	if err != nil {
 		return nil, err
 	}
