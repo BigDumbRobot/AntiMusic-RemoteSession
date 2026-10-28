@@ -1,4 +1,4 @@
-.PHONY: all go native test clean relay-linux app
+.PHONY: all go native test clean relay-linux app icons
 
 JUCE_DIR ?=
 # Relay built into rsession, e.g. make RELAY=relay.example.com:7401
@@ -49,10 +49,16 @@ app: native
 	cp app/RemoteSession/Info.plist $(APP)/Contents/
 	mkdir -p build/app-tmp/AppIcon.iconset
 	for s in 16 32 128 256 512; do \
-		sips -s format png -z $$s $$s "Anti-Music Logo.jpeg" --out build/app-tmp/AppIcon.iconset/icon_$${s}x$${s}.png >/dev/null; \
-		sips -s format png -z $$((s*2)) $$((s*2)) "Anti-Music Logo.jpeg" --out build/app-tmp/AppIcon.iconset/icon_$${s}x$${s}@2x.png >/dev/null; \
+		sips -z $$s $$s assets/icons/app-icon.png --out build/app-tmp/AppIcon.iconset/icon_$${s}x$${s}.png >/dev/null; \
+		sips -z $$((s*2)) $$((s*2)) assets/icons/app-icon.png --out build/app-tmp/AppIcon.iconset/icon_$${s}x$${s}@2x.png >/dev/null; \
 	done
 	iconutil -c icns -o $(APP)/Contents/Resources/AppIcon.icns build/app-tmp/AppIcon.iconset
 	codesign --force --deep --sign - $(APP)
 	rm -rf build/app-tmp
 	@echo "built $(APP)"
+
+# Regenerate assets/icons from the logo (tools/icons/make_icons.swift).
+icons:
+	@mkdir -p build
+	swiftc -O -o build/make_icons tools/icons/make_icons.swift
+	build/make_icons .

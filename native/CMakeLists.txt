@@ -43,6 +43,8 @@ endif()
 juce_add_plugin(RemoteSessionLink
     PRODUCT_NAME "RemoteSession Link"
     COMPANY_NAME "Anti-Music"
+    # Anti-Music plugin icon: stencil bass clef with glasses and mohawk.
+    ICON_BIG "${CMAKE_CURRENT_SOURCE_DIR}/../assets/icons/plugin-icon.png"
     BUNDLE_ID com.antimusic.remotesession.link
     PLUGIN_MANUFACTURER_CODE Antm
     PLUGIN_CODE RsLk
