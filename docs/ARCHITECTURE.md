@@ -297,6 +297,37 @@ dropped links and relay restarts, clean under the race detector.
 Not yet tested: from a different network (home); routers without UPnP;
 IPv6-only or carrier-grade NAT studios (detected and reported, not solved).
 
+### 9. Attended sessions: listen, chat, stems in, prints back
+
+The engineer works normally in Pro Tools; RemoteSession moves audio
+(`internal/session`). Every connection is dialled by the client with the
+pairing code, so nothing needs to reach the client's machine. Its first byte
+picks the job: an xfer frame (a take or stems bundle), control (chat and
+notices as JSON lines, 30 s pings), listen, or return. The client keeps one
+return connection parked at the engineer; prints go back over it with the
+normal take transfer, so they resume and verify the same way.
+
+Listen: the engineer's monitor source (e.g. Audio Bridge 2-B) is captured by
+`rs-capture` only while someone listens, converted to 48 kHz 24-bit stereo
+(about 2.3 Mbit/s) and fanned out; each listener's queue holds at most 0.5 s,
+so a slow link loses audio instead of drifting further behind. The client
+plays it through FFmpeg's AudioToolbox output (32-bit float). Clock drift
+between the two machines is not corrected yet; over long sessions it shows
+as an occasional dropout or a slowly growing delay.
+
+Stems and prints are bundles (`take.KindStems` / `take.KindPrints`): copies
+of WAV/BWF files plus a delivery report. A file is placed at its BWF
+timestamp minus the sender's Pro Tools session start when that is known
+(prints recorded in Pro Tools), otherwise at the session start (bounced
+stems). Both sides import by session offset, so a client in any DAW and an
+engineer in Pro Tools line up from the song start.
+
+Evidence (2026-10-28): `internal/session` test runs a full session over the
+encrypted direct path (chat both ways, stems in, listen stream with sample
+values checked, prints back; 5 runs clean under the race detector). A CLI
+session between two processes on one Mac did the same, with prints arriving
+byte-identical at their recorded positions (session +43852, +79835).
+
 ## Blockers and risks
 
 1. **The Link AAX is unsigned.** It loads and is verified in the Pro Tools

@@ -3,11 +3,13 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"net/netip"
@@ -26,6 +28,7 @@ import (
 	"antimusic.dev/remotesession/internal/pair"
 	"antimusic.dev/remotesession/internal/ptsl"
 	"antimusic.dev/remotesession/internal/recorder"
+	"antimusic.dev/remotesession/internal/session"
 	"antimusic.dev/remotesession/internal/take"
 	"antimusic.dev/remotesession/internal/timeline"
 	"antimusic.dev/remotesession/internal/transport"
@@ -42,7 +45,8 @@ commands:
   ptsl-status    show Pro Tools session and transport via PTSL
   ptsl-import    import a take's deliverables into Pro Tools at their positions
   send           copy a take to a receiver (resumes; record -send does this live)
-  receive        accept takes from senders; optionally deliver and import them
+  receive        host sessions (engineer): show the code, take stems/takes, stream the monitor mix, send prints
+  join           join a studio's session (client): chat, listen, send stems, receive prints
 `
 
 func main() {
@@ -68,6 +72,8 @@ func main() {
 		err = sendCmd(args)
 	case "receive":
 		err = receiveCmd(args)
+	case "join":
+		err = joinCmd(args)
 	default:
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)
@@ -526,7 +532,11 @@ func receiveCmd(args []string) error {
 	doImport := fs.Bool("import", false, "also import them into the open Pro Tools session (implies -deliver)")
 	addr := fs.String("ptsl-addr", ptsl.DefaultAddress, "PTSL address (with -import)")
 	dest := fs.String("dest", "", `with -import: folder to copy audio into (default: the session's "Audio Files")`)
-	events := fs.Bool("events", false, "print status as JSON lines on stdout (for the RemoteSession app)")
+	events := fs.Bool("events", false, "status as JSON lines on stdout, commands as JSON lines on stdin (for the app)")
+	listenDev := fs.String("listen-device", "", `monitor mix source clients can listen to (e.g. "Pro Tools Audio Bridge 2-B")`)
+	listenCh := fs.String("listen-ch", "1,2", "device channels for left,right of the listen stream")
+	name := fs.String("name", "", "studio name shown to clients")
+	printsDir := fs.String("prints-dir", "", "where outgoing prints are bundled (default: beside -dir)")
 	fs.Parse(args)
 	if *dir == "" {
 		return errors.New("receive: -dir is required")
@@ -551,6 +561,13 @@ func receiveCmd(args []string) error {
 	process := func(ctx context.Context, dir string) (string, error) { return "", nil }
 	if *doDeliver || *doImport {
 		process = func(ctx context.Context, dir string) (string, error) {
+			if m, err := take.ReadManifest(dir); err == nil && m.Kind != "" { // stems: already finished files
+				if !*doImport {
+					return "", nil
+				}
+				imp, err := importTake(ctx, dir, *addr, *dest)
+				return strings.Join(imp, "\n"), err
+			}
 			rep, err := deliver.Render(ctx, dir, deliver.Options{Codec: "pcm_s24le", Renderer: siblingTool("rs-render")})
 			if err != nil {
 				return "", fmt.Errorf("deliver: %w", err)
@@ -603,7 +620,7 @@ func receiveCmd(args []string) error {
 		ln = l
 		fmt.Fprintf(os.Stderr, "\n    Pairing code:  %s   (through relay %s)\n\n    Give this to the musician. Takes go to %s\n\n", code, r, *dir)
 		emit(map[string]any{"type": "code", "code": code.String(), "reach": "relay", "detail": "through relay " + r})
-		return rv.Serve(ctx, ln)
+		return serveHost(ctx, ln, rv, emit, *events, *listenDev, *listenCh, *name, *printsDir, *dir, *addr)
 	}
 
 	// Direct: the musician connects straight to this machine.
@@ -660,7 +677,245 @@ func receiveCmd(args []string) error {
 		ev["detail"] = "using your port forward at " + pub.String()
 	}
 	emit(ev)
-	return rv.Serve(ctx, ln)
+	return serveHost(ctx, ln, rv, emit, *events, *listenDev, *listenCh, *name, *printsDir, *dir, *addr)
+}
+
+// serveHost runs the engineer's side of sessions on ln. In events mode it
+// also reads commands from stdin: {"cmd":"chat","text":..} and
+// {"cmd":"send_prints","files":[..]}.
+func serveHost(ctx context.Context, ln net.Listener, rv *xfer.Receiver, emit func(map[string]any), events bool,
+	listenDev, listenCh, name, printsDir, dir, ptslAddr string) error {
+	host := &session.Host{Takes: rv, Name: name, Events: func(e session.Event) { emit(map[string]any(e)) }}
+	if !events {
+		host.Events = func(e session.Event) {
+			switch e["type"] {
+			case "chat":
+				fmt.Fprintf(os.Stderr, "[%s] %s\n", e["from"], e["text"])
+			case "client":
+				logStderr("receive: client %v connected: %v", e["name"], e["connected"])
+			}
+		}
+	}
+	if listenDev != "" {
+		var l, r int
+		if _, err := fmt.Sscanf(listenCh, "%d,%d", &l, &r); err != nil {
+			return fmt.Errorf("-listen-ch: want two channels like 1,2")
+		}
+		host.Monitor = &session.Monitor{Device: listenDev, Channels: [2]int{l, r}, Capture: recorder.FindCaptureHelper()}
+	}
+	if printsDir == "" {
+		printsDir = filepath.Join(filepath.Dir(filepath.Clean(dir)), "Prints Sent")
+	}
+	go readCommands(ctx, func(c command) {
+		switch c.Cmd {
+		case "chat":
+			host.Chat(c.Text)
+		case "send_prints":
+			go func() {
+				start := int64(-1) // place prints by their Pro Tools timestamps
+				if pc, s, err := connectPTSL(ctx, ptslAddr); err == nil {
+					start = s.StartSample
+					pc.Close()
+				}
+				d := filepath.Join(printsDir, "prints_"+time.Now().Format("2006-01-02_15-04-05"))
+				emit(map[string]any{"type": "prints", "state": "sending", "dir": d})
+				if _, err := session.Bundle(d, take.KindPrints, c.Files, start); err != nil {
+					emit(map[string]any{"type": "prints", "state": "failed", "error": err.Error()})
+					return
+				}
+				res, err := host.SendPrints(ctx, d)
+				if err != nil {
+					emit(map[string]any{"type": "prints", "state": "failed", "error": err.Error()})
+					return
+				}
+				emit(map[string]any{"type": "prints", "state": "delivered", "summary": res.Summary, "error": res.Error})
+			}()
+		}
+	}, !events, func(line string) { host.Chat(line) })
+	return host.Serve(ctx, ln)
+}
+
+type command struct {
+	Cmd   string   `json:"cmd"`
+	Text  string   `json:"text,omitempty"`
+	Files []string `json:"files,omitempty"`
+	On    bool     `json:"on,omitempty"`
+}
+
+// readCommands reads JSON commands from stdin, or plain chat lines when
+// plain is set (typing in a terminal).
+func readCommands(ctx context.Context, do func(command), plain bool, chat func(string)) {
+	sc := bufio.NewScanner(os.Stdin)
+	sc.Buffer(make([]byte, 1<<20), 1<<20)
+	for sc.Scan() && ctx.Err() == nil {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		var c command
+		if json.Unmarshal([]byte(line), &c) == nil && c.Cmd != "" {
+			do(c)
+		} else if plain {
+			chat(line)
+		}
+	}
+}
+
+// joinCmd is the client's side of a session.
+func joinCmd(args []string) error {
+	fs := flag.NewFlagSet("join", flag.ExitOnError)
+	code := fs.String("code", "", "the studio's pairing code")
+	relay := fs.String("relay", "", "optional relay host[:port], only for relay codes (default $RS_RELAY)")
+	dir := fs.String("dir", "", "folder for prints from the engineer")
+	name := fs.String("name", "", "your name, shown to the engineer")
+	doImport := fs.Bool("import", false, "import prints into the open Pro Tools session")
+	addr := fs.String("ptsl-addr", ptsl.DefaultAddress, "PTSL address (with -import)")
+	listen := fs.Bool("listen", false, "start listening to the engineer's monitor mix right away")
+	events := fs.Bool("events", false, "status as JSON lines on stdout, commands as JSON lines on stdin (for the app)")
+	fs.Parse(args)
+	if *code == "" || *dir == "" {
+		return errors.New("join: -code and -dir are required")
+	}
+	c, err := pair.ParseCode(*code)
+	if err != nil {
+		return err
+	}
+	r, err := relayAddr(*relay)
+	if err != nil {
+		return err
+	}
+	var emu sync.Mutex
+	enc := json.NewEncoder(os.Stdout)
+	emit := func(e session.Event) {
+		if *events {
+			emu.Lock()
+			enc.Encode(e)
+			emu.Unlock()
+			return
+		}
+		switch e["type"] {
+		case "chat":
+			fmt.Fprintf(os.Stderr, "[%s] %s\n", e["from"], e["text"])
+		default:
+			b, _ := json.Marshal(e)
+			logStderr("join: %s", b)
+		}
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	dial := func(ctx context.Context) (net.Conn, error) { return pair.Connect(ctx, r, c) }
+	prints := &xfer.Receiver{Root: *dir, Logf: func(f string, a ...any) { logStderr(f, a...) }}
+	prints.OnStart = func(d string) { emit(session.Event{"type": "prints", "state": "receiving", "take": filepath.Base(d)}) }
+	prints.OnComplete = func(ctx context.Context, d string) (string, error) {
+		ev := session.Event{"type": "prints", "state": "received", "take": filepath.Base(d), "dir": d}
+		var err error
+		var lines []string
+		if *doImport {
+			lines, err = importTake(ctx, d, *addr, "")
+			ev["imported"] = err == nil
+			if err != nil {
+				ev["error"] = err.Error()
+			}
+		}
+		emit(ev)
+		return strings.Join(lines, "\n"), err
+	}
+	g := &session.Guest{Dial: dial, Name: *name, Prints: prints, Events: emit}
+	if err := os.MkdirAll(*dir, 0o755); err != nil {
+		return err
+	}
+
+	var lmu sync.Mutex
+	var lcancel context.CancelFunc
+	setListen := func(on bool) {
+		lmu.Lock()
+		defer lmu.Unlock()
+		if lcancel != nil {
+			lcancel()
+			lcancel = nil
+		}
+		if on {
+			var lctx context.Context
+			lctx, lcancel = context.WithCancel(ctx)
+			go func() {
+				err := g.Listen(lctx, playOut)
+				if err != nil && lctx.Err() == nil {
+					emit(session.Event{"type": "listen", "state": "stopped", "error": err.Error()})
+				}
+			}()
+		} else {
+			emit(session.Event{"type": "listen", "state": "stopped"})
+		}
+	}
+	if *listen {
+		setListen(true)
+	}
+	go readCommands(ctx, func(cm command) {
+		switch cm.Cmd {
+		case "chat":
+			if err := g.Chat(cm.Text); err != nil {
+				emit(session.Event{"type": "error", "text": err.Error()})
+			}
+		case "listen":
+			setListen(cm.On)
+		case "send_stems":
+			go func() {
+				start := int64(-1)
+				if pc, s, err := connectPTSL(ctx, *addr); err == nil {
+					start = s.StartSample
+					pc.Close()
+				}
+				d := filepath.Join(filepath.Dir(filepath.Clean(*dir)), "Stems Sent", "stems_"+time.Now().Format("2006-01-02_15-04-05"))
+				emit(session.Event{"type": "stems", "state": "sending", "dir": d})
+				if _, err := session.Bundle(d, take.KindStems, cm.Files, start); err != nil {
+					emit(session.Event{"type": "stems", "state": "failed", "error": err.Error()})
+					return
+				}
+				res, err := (&xfer.Sender{Dir: d, Addr: "studio", Dial: dial, Logf: func(f string, a ...any) { logStderr(f, a...) }}).Run(ctx)
+				if err != nil {
+					emit(session.Event{"type": "stems", "state": "failed", "error": err.Error()})
+					return
+				}
+				emit(session.Event{"type": "stems", "state": "delivered", "summary": res.Summary, "error": res.Error})
+			}()
+		}
+	}, !*events, func(line string) { g.Chat(line) })
+	return g.Run(ctx)
+}
+
+// playOut plays a 24-bit stream on the default output device.
+func playOut(rate, channels int) (io.WriteCloser, error) {
+	cmd := exec.Command("ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error",
+		"-f", "s24le", "-ar", strconv.Itoa(rate), "-ac", strconv.Itoa(channels), "-i", "pipe:0",
+		"-c:a", "pcm_f32le", "-f", "audiotoolbox", "-")
+	w, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, err
+	}
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("starting playback (is FFmpeg installed?): %w", err)
+	}
+	return &player{w: w, cmd: cmd}, nil
+}
+
+type player struct {
+	w   io.WriteCloser
+	cmd *exec.Cmd
+}
+
+func (p *player) Write(b []byte) (int, error) { return p.w.Write(b) }
+func (p *player) Close() error {
+	p.w.Close()
+	done := make(chan struct{})
+	go func() { p.cmd.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		p.cmd.Process.Kill()
+		<-done
+	}
+	return nil
 }
 
 // siblingTool finds a helper binary next to this executable, falling back

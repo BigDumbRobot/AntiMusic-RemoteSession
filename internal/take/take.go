@@ -28,6 +28,12 @@ const (
 	DeliverDir    = "deliver"
 )
 
+// Kinds of take directory.
+const (
+	KindStems  = "stems"  // client to engineer
+	KindPrints = "prints" // engineer back to client
+)
+
 // State of a take's recording.
 const (
 	StateRecording = "recording" // still running, or the recorder died
@@ -47,14 +53,17 @@ type Session struct {
 
 // Manifest describes a take.
 type Manifest struct {
-	Version     int       `json:"version"`
-	Created     time.Time `json:"created"`
-	Input       []string  `json:"input"` // FFmpeg input arguments
-	SampleRate  int       `json:"sample_rate,omitempty"`
-	Channels    int       `json:"channels,omitempty"`
-	MasterCodec string    `json:"master_codec"`
-	State       string    `json:"state"`
-	Error       string    `json:"error,omitempty"`
+	Version int       `json:"version"`
+	Created time.Time `json:"created"`
+	// Kind is "" for a recorded take, or KindStems / KindPrints for a
+	// bundle of finished files to place directly.
+	Kind        string   `json:"kind,omitempty"`
+	Input       []string `json:"input"` // FFmpeg input arguments
+	SampleRate  int      `json:"sample_rate,omitempty"`
+	Channels    int      `json:"channels,omitempty"`
+	MasterCodec string   `json:"master_codec"`
+	State       string   `json:"state"`
+	Error       string   `json:"error,omitempty"`
 	// LatencyFrames is the capture-path latency used when placing the
 	// master (see timeline.Segments).
 	LatencyFrames int64    `json:"latency_frames"`

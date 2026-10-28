@@ -74,7 +74,7 @@ func (rv *Receiver) Serve(ctx context.Context, ln net.Listener) error {
 			defer c.Close()
 			stop := context.AfterFunc(ctx, func() { c.Close() })
 			defer stop()
-			if err := rv.handle(ctx, c); err != nil && ctx.Err() == nil {
+			if err := rv.HandleConn(ctx, c); err != nil && ctx.Err() == nil {
 				rv.logf("receive: %s: %v", c.RemoteAddr(), err)
 			}
 		}()
@@ -87,7 +87,8 @@ func (rv *Receiver) reject(w *bufio.Writer, msg string, fatal bool) error {
 	return errors.New(msg)
 }
 
-func (rv *Receiver) handle(ctx context.Context, c net.Conn) error {
+// HandleConn receives one take over an already-connected c.
+func (rv *Receiver) HandleConn(ctx context.Context, c net.Conn) error {
 	dc := &deadlineConn{Conn: c, timeout: 60 * time.Second}
 	r := bufio.NewReaderSize(dc, 1<<16)
 	w := bufio.NewWriter(dc)
@@ -145,7 +146,11 @@ func (rv *Receiver) handle(ctx context.Context, c net.Conn) error {
 		if f := files[name]; f != nil {
 			return f, nil
 		}
-		f, err := os.OpenFile(filepath.Join(dir, name), os.O_RDWR|os.O_CREATE, 0o644)
+		p := filepath.Join(dir, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			return nil, err
+		}
+		f, err := os.OpenFile(p, os.O_RDWR|os.O_CREATE, 0o644)
 		if err != nil {
 			return nil, err
 		}
@@ -183,7 +188,7 @@ func (rv *Receiver) handle(ctx context.Context, c net.Conn) error {
 			if err != nil {
 				return err
 			}
-			if !knownFile(name) || (t == msgPut && name != take.ManifestFile) || off < 0 {
+			if !validName(name) || (t == msgPut && name != take.ManifestFile) || off < 0 {
 				return rv.reject(w, fmt.Sprintf("unexpected file %q", name), true)
 			}
 			if t == msgPut {
@@ -261,10 +266,13 @@ func (rv *Receiver) handle(ctx context.Context, c net.Conn) error {
 func (rv *Receiver) compare(dir string, fin finish, files map[string]*os.File) (need, error) {
 	nd := need{Blocks: map[string][]int{}}
 	for name, want := range fin.Files {
-		if !knownFile(name) {
+		if !validName(name) {
 			return nd, fmt.Errorf("unexpected file %q", name)
 		}
-		path := filepath.Join(dir, name)
+		path := filepath.Join(dir, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return nd, err
+		}
 		if f := files[name]; f != nil {
 			if err := f.Truncate(want.Size); err != nil {
 				return nd, err

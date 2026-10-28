@@ -238,10 +238,10 @@ func (s *Sender) finish(r io.Reader, w *bufio.Writer) (*Result, error) {
 		resent := 0
 		buf := make([]byte, blockSize)
 		for f, blocks := range nd.Blocks {
-			if !knownFile(f) {
+			if !validName(f) {
 				return nil, fmt.Errorf("send: receiver asked for unknown file %q", f)
 			}
-			fh, err := os.Open(filepath.Join(s.Dir, f))
+			fh, err := os.Open(filepath.Join(s.Dir, filepath.FromSlash(f)))
 			if err != nil {
 				return nil, err
 			}
@@ -260,7 +260,7 @@ func (s *Sender) finish(r io.Reader, w *bufio.Writer) (*Result, error) {
 			}
 			fh.Close()
 		}
-		s.logf("send: resent %d changed block(s)", resent)
+		s.logf("send: sent %d block(s) to complete the copy", resent)
 	}
 	var d done
 	if err := readJSON(r, msgDone, &d); err != nil {

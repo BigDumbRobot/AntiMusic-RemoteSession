@@ -21,8 +21,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
+	"strings"
 
 	"antimusic.dev/remotesession/internal/take"
 )
@@ -48,20 +51,29 @@ const (
 	blockSize = 1 << 20 // bytes per verification hash
 )
 
-// Files synced, in send order. The manifest is replaced whole; the others
-// are shipped as they grow.
-var (
-	appendFiles = []string{take.MasterFile, take.CaptureLog, take.TransportFile}
-	syncedFiles = append([]string{take.ManifestFile}, appendFiles...)
-)
+// Files shipped as they grow while a take records. Every other file in
+// the directory (prints, delivery reports) is sent by the final
+// comparison. The manifest is always replaced whole.
+var appendFiles = []string{take.MasterFile, take.CaptureLog, take.TransportFile}
 
-func knownFile(name string) bool {
-	for _, f := range syncedFiles {
-		if f == name {
-			return true
+// skipDirs are produced on the receiving side and never sent.
+var skipDirs = map[string]bool{"imported": true}
+
+// validName accepts slash-separated relative paths inside the take
+// directory: no "..", no absolute paths, no hidden files.
+func validName(name string) bool {
+	if name == "" || len(name) > 512 || strings.HasPrefix(name, "/") || strings.Contains(name, "\\") {
+		return false
+	}
+	if path.Clean(name) != name {
+		return false
+	}
+	for _, part := range strings.Split(name, "/") {
+		if part == "" || part == ".." || strings.HasPrefix(part, ".") {
+			return false
 		}
 	}
-	return false
+	return true
 }
 
 type hello struct {
@@ -223,14 +235,34 @@ func sumFile(path string) (fileSum, error) {
 	}
 }
 
+// sumDir hashes every regular file under dir, skipping hidden entries and
+// receiver-side folders.
 func sumDir(dir string) (map[string]fileSum, error) {
 	out := map[string]fileSum{}
-	for _, name := range syncedFiles {
-		s, err := sumFile(filepath.Join(dir, name))
+	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return nil, err
+			return err
+		}
+		rel, _ := filepath.Rel(dir, p)
+		name := filepath.ToSlash(rel)
+		if p == dir {
+			return nil
+		}
+		if strings.HasPrefix(d.Name(), ".") || (d.IsDir() && skipDirs[name]) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !d.Type().IsRegular() || !validName(name) {
+			return nil
+		}
+		s, err := sumFile(p)
+		if err != nil {
+			return err
 		}
 		out[name] = s
-	}
-	return out, nil
+		return nil
+	})
+	return out, err
 }

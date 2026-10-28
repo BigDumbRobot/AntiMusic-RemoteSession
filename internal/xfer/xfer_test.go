@@ -95,7 +95,7 @@ func startReceiver(t *testing.T, rv *Receiver) string {
 
 func sameFiles(t *testing.T, a, b string) {
 	t.Helper()
-	for _, f := range syncedFiles {
+	for _, f := range []string{take.ManifestFile, take.MasterFile, take.CaptureLog, take.TransportFile} {
 		x, err := os.ReadFile(filepath.Join(a, f))
 		if err != nil {
 			t.Fatal(err)

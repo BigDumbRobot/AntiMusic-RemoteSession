@@ -33,21 +33,23 @@ The AAX build is unsigned (see the blockers in the architecture doc).
 ## The app
 
 `make app` builds `build/RemoteSession.app` (Apple Silicon and Intel, macOS 13+)
-with `rsession` and its helpers inside. Nothing else needs installing.
+with `rsession` and its helpers inside. Live listening and recording also need
+FFmpeg on the machine for now.
 
-- **Studio** tab: goes online when the app opens and shows the studio code in
-  large type with **Copy code** and **Copy invite** (code plus instructions to
-  paste into a message). Incoming takes are listed as they arrive and, with
-  the toggle on, imported into the open Pro Tools session. Quitting closes the
-  router port again. Takes are kept in `~/Music/RemoteSession/Received`.
-- **Send to a studio** tab: paste a code, pick what to record, press Record.
-  Sources: a track with the RemoteSession Link plugin in any DAW (AU/VST3;
-  AAX needs signing for retail Pro Tools), or an audio input such as Pro Tools
-  Audio Bridge, placed with Pro Tools' transport.
+Attended sessions: the engineer works in their own Pro Tools with their own
+gear; RemoteSession moves the audio.
 
-Takes land at the same distance from the session start as they were recorded,
-whatever DAW or start time the sender used; the delivered BWF files keep the
-sender's original timestamp too.
+- **Studio** (engineer): goes online when the app opens and shows the studio
+  code large with **Copy code** / **Copy invite**. Pick what the client hears
+  (e.g. Pro Tools Audio Bridge carrying the monitor mix), chat, run a session
+  clock, and **Send prints**: printed files land in the client's session at
+  the same spot as their stems. Incoming stems and takes are imported into the
+  open Pro Tools session. Quitting closes the router port.
+- **Join a studio** (client, any DAW): paste the code, **Join**, **Listen to
+  the studio**, chat, **Send stems** (bounced from the session start), and
+  receive prints, imported into Pro Tools or saved for any DAW. Live takes can
+  still be recorded straight to the studio through the Link plugin or an
+  Audio Bridge input.
 
 The app is ad-hoc signed. Copied to another Mac as a download, macOS blocks it
 until it is opened with right-click > Open (Developer ID signing and
@@ -78,6 +80,8 @@ bin/rsession record -link "Vox" -dir takes/take3
 bin/rsession receive -dir takes/received -import
 # Home (regular Pro Tools, tracks sent to Audio Bridge, timing via PTSL):
 bin/rsession record -device "Pro Tools Audio Bridge 2-A" -dir takes/home1 -ptsl -code 8RC4TK-8WX0K7-GDZCFA
+# Attended session from the command line: engineer adds -listen-device "Pro Tools Audio Bridge 2-B";
+# client: bin/rsession join -code <code> -dir prints -listen   (type to chat)
 # If the link drops, recording carries on; finish or re-send any take with:
 bin/rsession send -dir takes/home1 -code 8RC4TK-8WX0K7-GDZCFA
 # Router won't open ports: forward TCP 7400 yourself and add -public <your IP>,
@@ -108,7 +112,9 @@ bin/ptslverify -dir /tmp/rs-verify    # needs Pro Tools running; makes and disca
 | `internal/timeline` | transport events → placed segments, timecode, capture clock |
 | `internal/deliver` | BWF rendering and independent verification |
 | `internal/xfer` | live take copy: ships growth, verifies blocks, resumes |
+| `internal/session` | attended sessions: chat, live listen stream, stems in, prints back |
 | `internal/pair` | pairing codes, encrypted handshake, router port mapping, optional relay |
+| `app/RemoteSession/` | the SwiftUI app (`make app`) |
 | `cmd/rs-relay`, `deploy/relay/` | optional relay and its container |
 | `internal/ptsl` | Pro Tools Scripting Library client |
 | `internal/transport` | PTSL transport watcher |
