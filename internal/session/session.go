@@ -390,10 +390,18 @@ func (g *Guest) returnLine(ctx context.Context) {
 	}
 }
 
+// StreamFormat describes a listen stream: "opus" (each Write to the
+// player is one live.Packet, hello first) or "s24le" (raw 24-bit PCM).
+type StreamFormat struct {
+	Format   string
+	Rate     int
+	Channels int
+}
+
 // Listen plays the engineer's monitor mix until ctx ends, reconnecting
 // after drops. open is called for each stream with its format and must
-// return where the 24-bit little-endian PCM goes.
-func (g *Guest) Listen(ctx context.Context, open func(rate, channels int) (io.WriteCloser, error)) error {
+// return where the audio goes.
+func (g *Guest) Listen(ctx context.Context, open func(StreamFormat) (io.WriteCloser, error)) error {
 	backoff := time.Second
 	for ctx.Err() == nil {
 		err := g.listenOnce(ctx, open)
@@ -415,7 +423,7 @@ func errString(err error) string {
 	return err.Error()
 }
 
-func (g *Guest) listenOnce(ctx context.Context, open func(rate, channels int) (io.WriteCloser, error)) error {
+func (g *Guest) listenOnce(ctx context.Context, open func(StreamFormat) (io.WriteCloser, error)) error {
 	c, err := g.open(ctx, kindListen)
 	if err != nil {
 		return err
@@ -436,11 +444,18 @@ func (g *Guest) listenOnce(ctx context.Context, open func(rate, channels int) (i
 	if hdr.Error != "" {
 		return errors.New(hdr.Error)
 	}
-	w, err := open(hdr.Rate, hdr.Channels)
+	f := StreamFormat{Format: hdr.Format, Rate: hdr.Rate, Channels: hdr.Channels}
+	if f.Format == "" {
+		f.Format = "s24le"
+	}
+	w, err := open(f)
 	if err != nil {
 		return err
 	}
 	defer w.Close()
-	g.emit(Event{"type": "listen", "state": "playing", "rate": hdr.Rate})
+	g.emit(Event{"type": "listen", "state": "playing", "rate": hdr.Rate, "format": f.Format})
+	if f.Format == "opus" {
+		return readPackets(c, br, w)
+	}
 	return readFrames(c, br, w)
 }

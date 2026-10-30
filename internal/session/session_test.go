@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"antimusic.dev/remotesession/internal/deliver"
+	"antimusic.dev/remotesession/internal/live"
 	"antimusic.dev/remotesession/internal/pair"
 	"antimusic.dev/remotesession/internal/take"
 	"antimusic.dev/remotesession/internal/xfer"
@@ -124,9 +125,9 @@ func TestAttendedSession(t *testing.T) {
 	// Listen.
 	var heard syncBuf
 	lctx, lcancel := context.WithCancel(ctx)
-	go guest.Listen(lctx, func(rate, ch int) (io.WriteCloser, error) {
-		if rate != 48000 || ch != 2 {
-			t.Errorf("stream %d Hz %d ch", rate, ch)
+	go guest.Listen(lctx, func(f StreamFormat) (io.WriteCloser, error) {
+		if f.Rate != 48000 || f.Channels != 2 || f.Format != "s24le" {
+			t.Errorf("stream %+v", f)
 		}
 		return &heard, nil
 	})
@@ -200,4 +201,78 @@ func assertSameFile(t *testing.T, a, b string) {
 	if !bytes.Equal(x, y) {
 		t.Fatalf("%s differs from %s", filepath.Base(b), a)
 	}
+}
+
+// packetLog records each Write as one packet.
+type packetLog struct {
+	mu sync.Mutex
+	p  []live.Packet
+}
+
+func (l *packetLog) Write(b []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.p = append(l.p, live.Packet(bytes.Clone(b)))
+	return len(b), nil
+}
+func (l *packetLog) Close() error { return nil }
+func (l *packetLog) all() []live.Packet {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]live.Packet(nil), l.p...)
+}
+
+// With rs-live the monitor mix goes out as Opus: a hello packet, then
+// one packet per 10 ms in sequence.
+func TestListenOpus(t *testing.T) {
+	helper, _ := filepath.Abs("../../bin/rs-live")
+	if _, err := os.Stat(helper); err != nil {
+		t.Skip("bin/rs-live not built")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	studio := pair.NewCode()
+	dl := pair.ListenDirect(ctx, ln, studio, t.Logf)
+	defer dl.Close()
+	host := &Host{Name: "room", Events: func(Event) {},
+		Takes:   &xfer.Receiver{Root: t.TempDir()},
+		Monitor: &Monitor{Device: "fake", Channels: [2]int{1, 2}, Capture: fakeCapture(t), Live: helper}}
+	go host.Serve(ctx, dl)
+	code := studio.Direct(ln.Addr().(*net.TCPAddr).AddrPort())
+	guest := &Guest{Dial: func(ctx context.Context) (net.Conn, error) { return pair.Connect(ctx, "", code) },
+		Name: "Sam", Events: func(Event) {}, Prints: &xfer.Receiver{Root: t.TempDir()}}
+	go guest.Run(ctx)
+
+	var got packetLog
+	var format StreamFormat
+	lctx, lcancel := context.WithCancel(ctx)
+	defer lcancel()
+	go guest.Listen(lctx, func(f StreamFormat) (io.WriteCloser, error) { format = f; return &got, nil })
+	waitFor(t, "packets", func() bool { return len(got.all()) >= 50 })
+	lcancel()
+	p := got.all()
+	if format.Format != "opus" || format.Rate != 48000 {
+		t.Fatalf("format %+v", format)
+	}
+	f, ok := live.ParseHello(p[0])
+	if !ok || f.Rate != 48000 || f.Channels != 2 || f.Frame != 480 {
+		t.Fatalf("first packet is not the hello: %q", p[0])
+	}
+	for i, k := range p[1:] {
+		if k.Seq() != uint32(i) {
+			t.Fatalf("packet %d has sequence %d", i, k.Seq())
+		}
+		if n := len(k.Payload()); n < 10 || n > 1000 {
+			t.Fatalf("packet %d: %d bytes", i, n)
+		}
+	}
+	bits := 0
+	for _, k := range p[1:] {
+		bits += 8 * len(k)
+	}
+	t.Logf("%d packets, %.0f kbit/s", len(p)-1, float64(bits)/float64(len(p)-1)/10)
 }

@@ -17,11 +17,12 @@ and open blockers.
 ## Build and test
 
 Needs macOS with Xcode command line tools, Go 1.25+, CMake 3.22+ and FFmpeg.
-The native build downloads JUCE 8.0.10 on first run; pass
+The native build downloads JUCE 8.0.10 and Opus 1.5.2 (checksum pinned) on
+first run; pass
 `JUCE_DIR=/path/to/JUCE` to use an existing checkout.
 
 ```sh
-make          # bin/rs-capture (C, CoreAudio), Go tools, bin/rs-render and the Link plugin
+make          # bin/rs-capture (C, CoreAudio), bin/rs-live (Opus monitoring), Go tools, bin/rs-render and the Link plugin
 make go       # Go tools only: bin/rsession, bin/loopbacktest, bin/ptslverify
 make relay-linux                # optional: bin/linux/rs-relay for a server (or deploy/relay/Dockerfile)
 make test     # unit and end-to-end tests (needs ffmpeg; PTSL schema tests need Pro Tools installed)
@@ -112,6 +113,7 @@ bin/ptslverify -dir /tmp/rs-verify    # needs Pro Tools running; makes and disca
 | `native/render/` | `rs-render`, offline AU/VST3 chain renderer (JUCE) |
 | `native/link/` | RemoteSession Link plugin and its shared-memory ring format |
 | `internal/link` | reader for the Link plugin's ring |
+| `native/live/`, `internal/live` | `rs-live`: Opus encode, and playback with jitter buffer, concealment and drift control |
 | `internal/latency` | loopback round-trip measurement against the device's reported latency |
 | `internal/recorder` | starts the capture helper and FFmpeg, writes the take journal |
 | `internal/take` | take directory format |

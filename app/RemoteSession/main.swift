@@ -296,6 +296,7 @@ final class Client: ObservableObject {
     @Published var studio: String?
     @Published var status = ""
     @Published var listening = false
+    @Published var listenInfo = ""
     @Published var chat: [ChatLine] = []
     @Published var prints: [Take] = []
     @Published var stemsStatus = ""
@@ -348,6 +349,7 @@ final class Client: ObservableObject {
 
     func setListening(_ on: Bool) {
         listening = on
+        if !on { listenInfo = "" }
         job?.send(["cmd": "listen", "on": on])
     }
 
@@ -379,6 +381,13 @@ final class Client: ObservableObject {
             chat.append(ChatLine(mine: (ev["from"] as? String) == "client", text: ev["text"] as? String ?? ""))
         case "listen":
             if (ev["state"] as? String) == "playing" { listening = true }
+            if (ev["state"] as? String) == "stopped" { listenInfo = "" }
+            if let ms = ev["buffer_ms"] as? Double {
+                var info = (ev["buffering"] as? Bool ?? false) ? "Catching up…" : "Listening · \(Int(ms)) ms buffer"
+                let covered = ev["concealed"] as? Int ?? 0
+                if covered > 0 { info += " · \(covered) dropouts smoothed over" }
+                listenInfo = info
+            }
             if let e = ev["error"] as? String, !e.isEmpty { status = "Listen: " + e }
         case "stems":
             switch ev["state"] as? String {
@@ -915,6 +924,7 @@ struct JoinView: View {
                         .buttonStyle(NeonButton(color: Neon.pink, filled: true)).disabled(client.studio == nil)
                     Spacer()
                 }
+                if client.listening && !client.listenInfo.isEmpty { GlowText(text: client.listenInfo, color: Neon.dim, size: 11) }
                 if !client.stemsStatus.isEmpty { GlowText(text: client.stemsStatus, color: Neon.yellow, size: 12) }
                 GlowText(text: "Stems are placed from the start of your song. Bounce them from the session start.", color: Neon.dim, size: 11)
                 ChatBox(lines: client.chat, enabled: client.studio != nil) { client.say($0) }

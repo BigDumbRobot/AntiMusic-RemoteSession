@@ -14,10 +14,15 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"antimusic.dev/remotesession/internal/live"
 )
 
 // Stream wire format: one JSON header line, then frames of
-// [length u32 BE][interleaved 24-bit little-endian PCM].
+// [length u32 BE][payload]. Format "opus" (when rs-live is available):
+// each frame is a live.Packet (its own length prefix is the frame's), a
+// hello packet first. Format "s24le": the payload is interleaved 24-bit
+// little-endian PCM.
 type streamHeader struct {
 	Rate     int    `json:"rate,omitempty"`
 	Channels int    `json:"channels,omitempty"`
@@ -37,8 +42,14 @@ type Monitor struct {
 	Device   string // CoreAudio device name or UID
 	Channels [2]int // 1-based device channels for left and right
 	Capture  string // path to rs-capture
+	// Live is the rs-live helper. If set, the mix is sent as Opus
+	// (about 256 kbit/s instead of 2.3 Mbit/s) and played through a
+	// jitter buffer with drift control; otherwise as 24-bit PCM.
+	Live string
 
 	mu      sync.Mutex
+	hello   live.Packet // Opus stream format, sent to each new listener
+	enc     *live.Encoder
 	subs    map[chan []byte]bool
 	rate    int
 	running bool
@@ -54,9 +65,24 @@ func (m *Monitor) Stream(ctx context.Context, c net.Conn) error {
 		return err
 	}
 	defer m.unsubscribe(ch)
-	b, _ := json.Marshal(streamHeader{Rate: rate, Channels: 2, Format: "s24le"})
+	m.mu.Lock()
+	hello := m.hello
+	m.mu.Unlock()
+	format := "s24le"
+	if hello != nil {
+		format = "opus"
+		if f, ok := live.ParseHello(hello); ok {
+			rate = f.Rate
+		}
+	}
+	b, _ := json.Marshal(streamHeader{Rate: rate, Channels: 2, Format: format})
 	if _, err := c.Write(append(b, '\n')); err != nil {
 		return err
+	}
+	if hello != nil {
+		if _, err := c.Write(hello); err != nil {
+			return err
+		}
 	}
 	var hdr [4]byte
 	for {
@@ -67,8 +93,14 @@ func (m *Monitor) Stream(ctx context.Context, c net.Conn) error {
 			if !ok {
 				return errors.New("monitor capture stopped")
 			}
-			binary.BigEndian.PutUint32(hdr[:], uint32(len(buf)))
 			c.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if hello != nil {
+				if _, err := c.Write(buf); err != nil { // already framed
+					return err
+				}
+				continue
+			}
+			binary.BigEndian.PutUint32(hdr[:], uint32(len(buf)))
 			if _, err := c.Write(append(hdr[:], buf...)); err != nil {
 				return err
 			}
@@ -149,6 +181,20 @@ func (m *Monitor) start() error {
 		return fmt.Errorf("cannot capture the listen source %q (is it connected?)", m.Device)
 	}
 	m.rate, m.running, m.proc = int(h.Rate), true, cmd
+	m.hello, m.enc = nil, nil
+	if m.Live != "" {
+		enc, err := live.StartEncoder(live.EncoderConfig{Helper: m.Live, Rate: m.rate, Channels: 2})
+		if err == nil {
+			hello, herr := enc.Next()
+			if _, ok := live.ParseHello(hello); herr == nil && ok {
+				m.hello, m.enc = hello, enc
+				go m.pumpPackets(enc)
+			} else {
+				enc.Close()
+			}
+		}
+		// Without the helper the mix still goes out as PCM.
+	}
 	left, right := m.Channels[0]-1, m.Channels[1]-1
 	if left < 0 || left >= h.Channels {
 		left = 0
@@ -156,18 +202,61 @@ func (m *Monitor) start() error {
 	if right < 0 || right >= h.Channels {
 		right = min(1, h.Channels-1)
 	}
-	go m.pump(cmd, stdout, h.Channels, left, right)
+	go m.pump(cmd, stdout, h.Channels, left, right, m.enc)
 	return nil
 }
 
-// pump converts captured float32 to stereo 24-bit and fans it out. A slow
-// listener loses its oldest audio rather than falling further behind.
-func (m *Monitor) pump(cmd *exec.Cmd, r io.Reader, devCh, left, right int) {
+// pumpPackets fans the encoder's packets out to the listeners.
+func (m *Monitor) pumpPackets(enc *live.Encoder) {
+	for {
+		p, err := enc.Next()
+		if err != nil {
+			return
+		}
+		m.fanOut(p)
+	}
+}
+
+// fanOut queues buf for every listener. A slow listener loses its
+// oldest audio rather than falling further behind. Called without m.mu.
+func (m *Monitor) fanOut(buf []byte) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for ch := range m.subs {
+		select {
+		case ch <- buf:
+		default:
+			select {
+			case <-ch:
+			default:
+			}
+			select {
+			case ch <- buf:
+			default:
+			}
+		}
+	}
+}
+
+// pump takes the two monitor channels from the capture and sends them
+// to the Opus encoder, or converts them to 24-bit PCM and fans them out.
+func (m *Monitor) pump(cmd *exec.Cmd, r io.Reader, devCh, left, right int, enc *live.Encoder) {
 	in := make([]byte, blockFrames*devCh*4)
 	br := bufio.NewReaderSize(r, len(in)*8)
+	stereo := make([]byte, blockFrames*2*4)
 	for {
 		if _, err := io.ReadFull(br, in); err != nil {
 			break
+		}
+		if enc != nil {
+			for f := 0; f < blockFrames; f++ {
+				copy(stereo[f*8:], in[(f*devCh+left)*4:(f*devCh+left)*4+4])
+				copy(stereo[f*8+4:], in[(f*devCh+right)*4:(f*devCh+right)*4+4])
+			}
+			if _, err := enc.In.Write(stereo); err != nil {
+				break
+			}
+			continue
 		}
 		out := make([]byte, blockFrames*2*3)
 		for f := 0; f < blockFrames; f++ {
@@ -178,22 +267,10 @@ func (m *Monitor) pump(cmd *exec.Cmd, r io.Reader, devCh, left, right int) {
 				out[o], out[o+1], out[o+2] = byte(s), byte(s>>8), byte(s>>16)
 			}
 		}
-		m.mu.Lock()
-		for ch := range m.subs {
-			select {
-			case ch <- out:
-			default:
-				select {
-				case <-ch:
-				default:
-				}
-				select {
-				case ch <- out:
-				default:
-				}
-			}
-		}
-		m.mu.Unlock()
+		m.fanOut(out)
+	}
+	if enc != nil {
+		enc.Close()
 	}
 	cmd.Wait()
 	m.mu.Lock()
@@ -203,6 +280,20 @@ func (m *Monitor) pump(cmd *exec.Cmd, r io.Reader, devCh, left, right int) {
 	}
 	m.running, m.proc = false, nil
 	m.mu.Unlock()
+}
+
+// readPackets copies Opus packets from br to w, one Write per packet.
+func readPackets(c net.Conn, br *bufio.Reader, w io.Writer) error {
+	for {
+		c.SetReadDeadline(time.Now().Add(15 * time.Second))
+		p, err := live.ReadPacket(br)
+		if err != nil {
+			return err
+		}
+		if _, err := w.Write(p); err != nil {
+			return err
+		}
+	}
 }
 
 // readFrames copies stream frames from br to w.

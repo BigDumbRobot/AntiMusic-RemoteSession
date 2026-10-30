@@ -386,6 +386,53 @@ master and the capture log every second and once at the end, so a power
 loss loses at most about a second. The transport log was already synced
 per event.
 
+### 12. Listening is Opus through a jitter buffer with drift control
+
+The engineer's monitor mix used to go out as 24-bit PCM (2.3 Mbit/s) and
+play through FFmpeg, with up to 0.5 s of queue and no drift correction.
+Now `rs-live` (`native/live`, Opus 1.5.2 linked statically, universal)
+does the audio work on both ends and Go only moves packets:
+
+- `rs-live encode`: stereo float in, Opus out (restricted low-delay,
+  256 kbit/s, 10 ms frames; inputs at 44.1 kHz are resampled to 48).
+  About 270 kbit/s on the wire.
+- `rs-live play`: packets in, CoreAudio out.
+  - The jitter buffer holds a target depth: all audio queued ahead of the
+    device, packets plus what the resampler and the 20 ms output ring hold.
+  - A windowed-sinc resampler absorbs the clock difference between the
+    two machines. A PI controller steers the depth to the target, the
+    ratio is limited to ±0.1 % (1.7 cents), and the depth is smoothed over
+    2 s so packet steps do not wobble the pitch.
+  - A packet missing when the ring is about to run dry is concealed with
+    Opus PLC. A burst after a stall is skipped back to the target. If
+    nothing arrives for five packets, it rebuffers.
+  - Underruns and late packets raise the target by 10 ms (up to 300); 30
+    quiet seconds lower it by 5 (down to 20). Plain loss does not raise it,
+    since more buffer would not help.
+  - The decoder thread runs at user-interactive priority; at default
+    priority it was measured missing a 12 ms refill under load.
+- Wire: `[u32 length][u32 sequence][Opus]`, a hello packet with the
+  format first. The listen header says `"format":"opus"`. Without the
+  helper the studio still sends `s24le`, and clients play both.
+
+Evidence (2026-10-30). `internal/live` tests play a 997 Hz tone through
+encode, a simulated network and `play --null` (a device clock on a
+real-time thread, running fast or slow by a set ppm), then measure the
+tone in every 20 ms of what was played:
+
+| Network | Result |
+|---|---|
+| In order, 0-15 ms jitter, receiver +200 ppm, 30 s | 0 underruns, 0 concealed, 0 dropouts in 1500 windows; ratio settles near -300 ppm |
+| 150 ms stall, receiver -200 ppm, 12 s | 13-17 packets concealed, 8-18 skipped, 0 underruns; 9-12 of 600 windows low, all at the stall |
+| 2 % loss, reordering, 0-20 ms jitter, 12 s | 26 concealed, 0 underruns, target stays at 40 ms; 0-3 windows low |
+
+A local session (studio and client as two processes, Audio Bridge 2-B
+captured, default output played) ran with 0 underruns at a 40 ms target.
+
+Not done yet: UDP (TCP still stalls everything behind a lost segment;
+the stall test shows what that costs), and the reverse direction (the
+engineer hearing the musician live).
+
 ## Blockers and risks
 
 1. **The Link AAX is unsigned.** It loads and is verified in the Pro Tools
@@ -402,6 +449,7 @@ per event.
 
 ## Not started (by design, per the phase plan)
 
-- Live monitoring transport (Opus/UDP or alternatives): Phase 3.
+- Live monitoring over UDP, and from the musician to the engineer: the
+  rest of Phase 3 (section 12 has the Opus part).
 - Session-aware cache: Phase 4.
 - Collaboration, authentication, UI: Phase 5.

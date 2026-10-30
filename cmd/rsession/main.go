@@ -26,6 +26,7 @@ import (
 	"antimusic.dev/remotesession/internal/deliver"
 	"antimusic.dev/remotesession/internal/latency"
 	"antimusic.dev/remotesession/internal/link"
+	"antimusic.dev/remotesession/internal/live"
 	"antimusic.dev/remotesession/internal/pair"
 	"antimusic.dev/remotesession/internal/ptsl"
 	"antimusic.dev/remotesession/internal/recorder"
@@ -715,7 +716,7 @@ func serveHost(ctx context.Context, ln net.Listener, rv *xfer.Receiver, emit fun
 		if _, err := fmt.Sscanf(listenCh, "%d,%d", &l, &r); err != nil {
 			return fmt.Errorf("-listen-ch: want two channels like 1,2")
 		}
-		host.Monitor = &session.Monitor{Device: listenDev, Channels: [2]int{l, r}, Capture: recorder.FindCaptureHelper()}
+		host.Monitor = &session.Monitor{Device: listenDev, Channels: [2]int{l, r}, Capture: recorder.FindCaptureHelper(), Live: liveHelper()}
 	}
 	if printsDir == "" {
 		printsDir = filepath.Join(filepath.Dir(filepath.Clean(dir)), "Prints Sent")
@@ -785,6 +786,7 @@ func joinCmd(args []string) error {
 	doImport := fs.Bool("import", false, "import prints into the open Pro Tools session")
 	addr := fs.String("ptsl-addr", ptsl.DefaultAddress, "PTSL address (with -import)")
 	listen := fs.Bool("listen", false, "start listening to the engineer's monitor mix right away")
+	listenOut := fs.String("listen-out", "", "output device for listening (default: the system output)")
 	events := fs.Bool("events", false, "status as JSON lines on stdout, commands as JSON lines on stdin (for the app)")
 	fs.Parse(args)
 	if *code == "" || *dir == "" {
@@ -852,7 +854,12 @@ func joinCmd(args []string) error {
 			var lctx context.Context
 			lctx, lcancel = context.WithCancel(ctx)
 			go func() {
-				err := g.Listen(lctx, playOut)
+				err := g.Listen(lctx, func(f session.StreamFormat) (io.WriteCloser, error) {
+					if f.Format == "opus" {
+						return playOpus(*listenOut, emit)
+					}
+					return playOut(f.Rate, f.Channels)
+				})
 				if err != nil && lctx.Err() == nil {
 					emit(session.Event{"type": "listen", "state": "stopped", "error": err.Error()})
 				}
@@ -895,6 +902,51 @@ func joinCmd(args []string) error {
 		}
 	}, !*events, func(line string) { g.Chat(line) })
 	return g.Run(ctx)
+}
+
+// liveHelper returns the rs-live helper, or "" if it is not installed
+// (the studio then streams uncompressed PCM).
+func liveHelper() string {
+	h := live.FindHelper()
+	if p, err := exec.LookPath(h); err == nil {
+		return p
+	}
+	return ""
+}
+
+// playOpus plays an Opus listen stream through rs-live (jitter buffer,
+// drift control, CoreAudio) and reports its buffer once a second.
+func playOpus(device string, emit func(session.Event)) (io.WriteCloser, error) {
+	h := liveHelper()
+	if h == "" {
+		return nil, errors.New("rs-live is missing; reinstall RemoteSession")
+	}
+	p, err := live.StartPlayer(live.PlayerConfig{Helper: h, Device: device, OnStats: func(s live.Stats) {
+		if s.Done || s.Received == 0 {
+			return
+		}
+		emit(session.Event{"type": "listen", "state": "playing", "buffer_ms": math.Round(s.TargetMs),
+			"depth_ms": math.Round(s.DepthMs), "concealed": s.PLC, "late": s.Late, "underruns": s.Underruns,
+			"buffering": s.Buffering})
+	}})
+	if err != nil {
+		return nil, err
+	}
+	return opusPlayer{p}, nil
+}
+
+type opusPlayer struct{ p *live.Player }
+
+func (o opusPlayer) Write(b []byte) (int, error) {
+	if err := o.p.Write(live.Packet(b)); err != nil {
+		return 0, err
+	}
+	return len(b), nil
+}
+
+func (o opusPlayer) Close() error {
+	o.p.Stop()
+	return nil
 }
 
 // playOut plays a 24-bit stream on the default output device.

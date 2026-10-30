@@ -5,11 +5,22 @@ JUCE_DIR ?=
 RELAY ?=
 CMAKE_JUCE := $(if $(JUCE_DIR),-DFETCHCONTENT_SOURCE_DIR_JUCE=$(JUCE_DIR),)
 
-all: bin/rs-capture go native
+all: bin/rs-capture bin/rs-live go native
 
 bin/rs-capture: native/capture/rs-capture.c
 	@mkdir -p bin
 	clang -O2 -Wall -Wextra -std=c11 -framework CoreAudio -framework CoreFoundation -o $@ $<
+
+# rs-live: Opus monitoring (encode, and play with jitter buffer and drift
+# control). Opus 1.5.2 is fetched and linked statically, one build per
+# architecture.
+LIVE_SRC := native/live/rs-live.c native/live/CMakeLists.txt
+native/live/build-%/rs-live: $(LIVE_SRC)
+	cmake -S native/live -B native/live/build-$* -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=$*
+	cmake --build native/live/build-$* -j8
+bin/rs-live: native/live/build-arm64/rs-live native/live/build-x86_64/rs-live
+	@mkdir -p bin
+	lipo -create -output $@ $^
 
 go:
 	go build -ldflags "-X main.defaultRelay=$(RELAY)" -o bin/ ./cmd/...
@@ -35,7 +46,7 @@ clean:
 # RemoteSession.app: the window app with rsession and helpers inside.
 # Universal (Apple Silicon + Intel); ad-hoc signed.
 APP := build/RemoteSession.app
-app: native
+app: native bin/rs-live
 	rm -rf $(APP) build/app-tmp && mkdir -p $(APP)/Contents/MacOS $(APP)/Contents/Resources/bin build/app-tmp
 	swiftc -parse-as-library -O -target arm64-apple-macos13 -o build/app-tmp/ui-arm64 app/RemoteSession/main.swift
 	swiftc -parse-as-library -O -target x86_64-apple-macos13 -o build/app-tmp/ui-x86_64 app/RemoteSession/main.swift
@@ -46,6 +57,7 @@ app: native
 	clang -O2 -Wall -Wextra -std=c11 -arch arm64 -arch x86_64 -mmacosx-version-min=11.0 -framework CoreAudio -framework CoreFoundation \
 		-o $(APP)/Contents/Resources/bin/rs-capture native/capture/rs-capture.c
 	cp native/build/rs-render_artefacts/Release/rs-render $(APP)/Contents/Resources/bin/
+	cp bin/rs-live $(APP)/Contents/Resources/bin/
 	cp app/RemoteSession/Info.plist $(APP)/Contents/
 	mkdir -p build/app-tmp/AppIcon.iconset
 	for s in 16 32 128 256 512; do \
