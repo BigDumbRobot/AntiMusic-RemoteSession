@@ -538,7 +538,7 @@ func reportSend(res *xfer.Result, err error) error {
 func receiveCmd(args []string) error {
 	fs := flag.NewFlagSet("receive", flag.ExitOnError)
 	port := fs.Int("port", xfer.DefaultPort, "TCP port to accept musicians on (also requested on the router)")
-	public := fs.String("public", "", "public ip[:port] when you forwarded the port on the router yourself (skips automatic setup)")
+	public := fs.String("public", "", "public ip[:port] when you forwarded the port (TCP, and UDP for listen audio) on the router yourself (skips automatic setup)")
 	relay := fs.String("relay", "", "optional relay host[:port] instead of a direct connection (default $RS_RELAY)")
 	codeFlag := fs.String("code", "", "use this pairing code's secret instead of the studio's saved one")
 	newCode := fs.Bool("new-code", false, "replace the studio's saved secret (old codes stop working)")
@@ -635,7 +635,7 @@ func receiveCmd(args []string) error {
 		ln = l
 		fmt.Fprintf(os.Stderr, "\n    Pairing code:  %s   (through relay %s)\n\n    Give this to the musician. Takes go to %s\n\n", code, r, *dir)
 		emit(map[string]any{"type": "code", "code": code.String(), "reach": "relay", "detail": "through relay " + r})
-		return serveHost(ctx, ln, rv, emit, *events, *listenDev, *listenCh, *name, *printsDir, *dir, *addr)
+		return serveHost(ctx, ln, nil, rv, emit, *events, *listenDev, *listenCh, *name, *printsDir, *dir, *addr)
 	}
 
 	// Direct: the musician connects straight to this machine.
@@ -674,6 +674,38 @@ func receiveCmd(args []string) error {
 		}
 	}
 	defer func() { stop(); <-mapped }()
+
+	// Listen audio also goes by UDP on the same port number when clients
+	// can reach it; TCP remains the fallback.
+	var mux *session.UDPMux
+	if uc, err := net.ListenUDP("udp4", &net.UDPAddr{Port: *port}); err != nil {
+		logf("listen audio stays on TCP: %v", err)
+	} else {
+		uport := int(pub.Port()) // -public: forward UDP as well as TCP
+		if *public == "" && !lanOnly {
+			mctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			um, err := pair.MapPortProto(mctx, "UDP", *port, int(pub.Port()))
+			cancel()
+			if err == nil {
+				uport = int(um.External.Port())
+				umapped := make(chan struct{})
+				go func() { defer close(umapped); um.Keep(ctx, logf) }()
+				defer func() { stop(); <-umapped }()
+			} else {
+				logf("router would not open UDP (listen audio stays on TCP): %v", err)
+				uport = 0
+			}
+		} else if lanOnly {
+			uport = *port
+		}
+		if uport > 0 {
+			mux = session.NewUDPMux(uc, uport)
+			defer mux.Close()
+		} else {
+			uc.Close()
+		}
+	}
+
 	l := pair.ListenDirect(ctx, tl, code, logf)
 	defer l.Close()
 	ln = l
@@ -692,15 +724,15 @@ func receiveCmd(args []string) error {
 		ev["detail"] = "using your port forward at " + pub.String()
 	}
 	emit(ev)
-	return serveHost(ctx, ln, rv, emit, *events, *listenDev, *listenCh, *name, *printsDir, *dir, *addr)
+	return serveHost(ctx, ln, mux, rv, emit, *events, *listenDev, *listenCh, *name, *printsDir, *dir, *addr)
 }
 
 // serveHost runs the engineer's side of sessions on ln. In events mode it
 // also reads commands from stdin: {"cmd":"chat","text":..} and
 // {"cmd":"send_prints","files":[..]}.
-func serveHost(ctx context.Context, ln net.Listener, rv *xfer.Receiver, emit func(map[string]any), events bool,
+func serveHost(ctx context.Context, ln net.Listener, udp *session.UDPMux, rv *xfer.Receiver, emit func(map[string]any), events bool,
 	listenDev, listenCh, name, printsDir, dir, ptslAddr string) error {
-	host := &session.Host{Takes: rv, Name: name, Events: func(e session.Event) { emit(map[string]any(e)) }}
+	host := &session.Host{Takes: rv, Name: name, UDP: udp, Events: func(e session.Event) { emit(map[string]any(e)) }}
 	if !events {
 		host.Events = func(e session.Event) {
 			switch e["type"] {
@@ -837,6 +869,9 @@ func joinCmd(args []string) error {
 		return strings.Join(lines, "\n"), err
 	}
 	g := &session.Guest{Dial: dial, Name: *name, Prints: prints, Events: emit}
+	if c.IsDirect() {
+		g.UDPHost = c.Addr.Addr() // listen audio by UDP when the studio offers it
+	}
 	if err := os.MkdirAll(*dir, 0o755); err != nil {
 		return err
 	}

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"sync"
 	"time"
@@ -57,6 +58,7 @@ func writeJSON(path string, v any) error {
 type Host struct {
 	Takes   *xfer.Receiver // stems and takes from the client
 	Monitor *Monitor       // live listen source; nil disables listening
+	UDP     *UDPMux        // listen audio over UDP when clients can reach it; nil: TCP only
 	Events  func(Event)
 	Name    string
 
@@ -143,7 +145,7 @@ func (h *Host) dispatch(ctx context.Context, c net.Conn) {
 			fmt.Fprintln(c, `{"error":"the engineer has not set a listen source"}`)
 			return
 		}
-		if err := h.Monitor.Stream(ctx, c); err != nil && ctx.Err() == nil {
+		if err := h.Monitor.Stream(ctx, c, h.UDP); err != nil && ctx.Err() == nil {
 			h.emit(Event{"type": "log", "text": "listen stream ended: " + err.Error()})
 		}
 	case kindReturn:
@@ -246,6 +248,9 @@ type Guest struct {
 	Name   string
 	Prints *xfer.Receiver // where prints from the engineer arrive
 	Events func(Event)
+	// UDPHost is the studio's address for listen audio over UDP (from a
+	// direct code). Unset, listening stays on TCP.
+	UDPHost netip.Addr
 
 	mu   sync.Mutex
 	ctrl *controlConn
@@ -455,7 +460,16 @@ func (g *Guest) listenOnce(ctx context.Context, open func(StreamFormat) (io.Writ
 	defer w.Close()
 	g.emit(Event{"type": "listen", "state": "playing", "rate": hdr.Rate, "format": f.Format})
 	if f.Format == "opus" {
-		return readPackets(c, br, w)
+		lw := &lockedWriter{w: w}
+		if hdr.UDP != nil && g.UDPHost.IsValid() {
+			if u, err := dialUDP(g.UDPHost, *hdr.UDP); err == nil {
+				defer u.Close()
+				uctx, ucancel := context.WithCancel(ctx)
+				defer ucancel()
+				go g.udpListen(uctx, u, lw)
+			}
+		}
+		return readPackets(c, br, lw)
 	}
 	return readFrames(c, br, w)
 }

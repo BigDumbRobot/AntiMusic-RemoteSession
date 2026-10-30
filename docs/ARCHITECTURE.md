@@ -429,9 +429,43 @@ tone in every 20 ms of what was played:
 A local session (studio and client as two processes, Audio Bridge 2-B
 captured, default output played) ran with 0 underruns at a 40 ms target.
 
-Not done yet: UDP (TCP still stalls everything behind a lost segment;
-the stall test shows what that costs), and the reverse direction (the
-engineer hearing the musician live).
+Not done yet: the reverse direction (the engineer hearing the musician
+live).
+
+### 13. Listen audio goes by UDP when it can, TCP otherwise
+
+Over TCP one lost segment stalls everything behind it (the stall test
+above). The studio now also listens on UDP, on the same port number. With
+automatic router setup it asks the router for UDP too; with `-public` it
+assumes UDP is forwarded with TCP. Relay codes stay on TCP.
+
+- The listen stream starts on TCP, which is already authenticated by the
+  pairing code and encrypted. Its header offers UDP: the port, a random
+  8-byte session id and a fresh AES-256 key for this stream.
+- The client sends hellos from its own UDP socket every 250 ms. They open
+  its NAT, tell the studio where to send, and say whether UDP audio is
+  arriving. Hellos must carry increasing counters, so a replayed hello
+  cannot redirect the stream.
+- Datagrams are `[id 8][counter 8][AES-GCM]`, with the direction in the
+  nonce. The client merges UDP and TCP packets into the player; the jitter
+  buffer drops duplicates.
+- While hellos arrive, the studio sends by UDP and keeps TCP alive with
+  the hello packet every 2 s. If hellos stop for 1 s, it falls back to TCP
+  and returns when they resume. If UDP audio has not reached the client
+  2 s after starting (inbound blocked), it stays on TCP for that stream.
+
+Evidence (2026-10-30): `TestListenUDP` runs a session with a real-time
+source through a UDP proxy that can drop either direction:
+
+- Switching to UDP: no gap.
+- Both directions cut: back on TCP after about 1 s (about 100 packets
+  concealed or lost).
+- Restored: back on UDP.
+- Only studio-to-client cut: settles on TCP after about 1.75 s, with no
+  further gaps.
+
+Two processes on one Mac (through the LAN address) switched to UDP within
+the first second, with 0 underruns.
 
 ## Blockers and risks
 
@@ -449,7 +483,7 @@ engineer hearing the musician live).
 
 ## Not started (by design, per the phase plan)
 
-- Live monitoring over UDP, and from the musician to the engineer: the
-  rest of Phase 3 (section 12 has the Opus part).
+- Live audio from the musician to the engineer: the rest of Phase 3
+  (sections 12 and 13 cover the engineer-to-client direction).
 - Session-aware cache: Phase 4.
 - Collaboration, authentication, UI: Phase 5.

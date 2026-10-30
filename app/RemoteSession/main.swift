@@ -297,6 +297,7 @@ final class Client: ObservableObject {
     @Published var status = ""
     @Published var listening = false
     @Published var listenInfo = ""
+    private var listenPath = ""
     @Published var chat: [ChatLine] = []
     @Published var prints: [Take] = []
     @Published var stemsStatus = ""
@@ -381,9 +382,11 @@ final class Client: ObservableObject {
             chat.append(ChatLine(mine: (ev["from"] as? String) == "client", text: ev["text"] as? String ?? ""))
         case "listen":
             if (ev["state"] as? String) == "playing" { listening = true }
-            if (ev["state"] as? String) == "stopped" { listenInfo = "" }
+            if (ev["state"] as? String) == "stopped" { listenInfo = ""; listenPath = "" }
+            if let p = ev["path"] as? String { listenPath = p }
             if let ms = ev["buffer_ms"] as? Double {
                 var info = (ev["buffering"] as? Bool ?? false) ? "Catching up…" : "Listening · \(Int(ms)) ms buffer"
+                if listenPath == "udp" { info += " · direct (UDP)" } else if listenPath == "tcp" { info += " · TCP" }
                 let covered = ev["concealed"] as? Int ?? 0
                 if covered > 0 { info += " · \(covered) dropouts smoothed over" }
                 listenInfo = info

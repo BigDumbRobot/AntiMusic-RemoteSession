@@ -15,8 +15,8 @@ import (
 	"time"
 )
 
-// PortMapping is a TCP port opened on the local router, so peers on the
-// internet can reach this machine directly.
+// PortMapping is a TCP or UDP port opened on the local router, so peers
+// on the internet can reach this machine directly.
 type PortMapping struct {
 	External netip.AddrPort // what peers dial
 	Method   string         // "UPnP" or "NAT-PMP"
@@ -30,17 +30,22 @@ const mappingLease = time.Hour
 // MapPort asks the router to forward external TCP port `want` (or another
 // free one) to this machine's port `internal`. It tries NAT-PMP, then UPnP.
 func MapPort(ctx context.Context, internal, want int) (*PortMapping, error) {
+	return MapPortProto(ctx, "TCP", internal, want)
+}
+
+// MapPortProto is MapPort for proto "TCP" or "UDP".
+func MapPortProto(ctx context.Context, proto string, internal, want int) (*PortMapping, error) {
 	gw, local, err := defaultRoute()
 	if err != nil {
 		return nil, err
 	}
 	var errs []string
-	if m, err := mapNATPMP(ctx, gw, internal, want); err == nil {
+	if m, err := mapNATPMP(ctx, gw, proto, internal, want); err == nil {
 		return m, nil
 	} else {
 		errs = append(errs, "NAT-PMP: "+err.Error())
 	}
-	if m, err := mapUPnP(ctx, local, internal, want); err == nil {
+	if m, err := mapUPnP(ctx, local, proto, internal, want); err == nil {
 		return m, nil
 	} else {
 		errs = append(errs, "UPnP: "+err.Error())
@@ -116,7 +121,7 @@ func natpmpCall(ctx context.Context, gw netip.Addr, req []byte, respLen int) ([]
 	return nil, errors.New("no answer")
 }
 
-func mapNATPMP(ctx context.Context, gw netip.Addr, internal, want int) (*PortMapping, error) {
+func mapNATPMP(ctx context.Context, gw netip.Addr, proto string, internal, want int) (*PortMapping, error) {
 	r, err := natpmpCall(ctx, gw, []byte{0, 0}, 12)
 	if err != nil {
 		return nil, err
@@ -125,6 +130,9 @@ func mapNATPMP(ctx context.Context, gw netip.Addr, internal, want int) (*PortMap
 	mapReq := func(lease uint32) ([]byte, error) {
 		req := make([]byte, 12)
 		req[1] = 2 // map TCP
+		if proto == "UDP" {
+			req[1] = 1
+		}
 		binary.BigEndian.PutUint16(req[4:], uint16(internal))
 		binary.BigEndian.PutUint16(req[6:], uint16(want))
 		binary.BigEndian.PutUint32(req[8:], lease)
@@ -230,7 +238,7 @@ func xmlField(s, name string) string {
 	return strings.SplitN(s[i+len(name)+2:], "<", 2)[0]
 }
 
-func mapUPnP(ctx context.Context, local netip.Addr, internal, want int) (*PortMapping, error) {
+func mapUPnP(ctx context.Context, local netip.Addr, proto string, internal, want int) (*PortMapping, error) {
 	loc, err := ssdpDiscover(ctx)
 	if err != nil {
 		return nil, err
@@ -273,10 +281,10 @@ func mapUPnP(ctx context.Context, local netip.Addr, internal, want int) (*PortMa
 		return nil, fmt.Errorf("router's outside address %s is itself private (another router or the ISP is in front)", ext)
 	}
 	add := func(port int, lease time.Duration) error {
-		args := fmt.Sprintf("<NewRemoteHost></NewRemoteHost><NewExternalPort>%d</NewExternalPort><NewProtocol>TCP</NewProtocol>"+
+		args := fmt.Sprintf("<NewRemoteHost></NewRemoteHost><NewExternalPort>%d</NewExternalPort><NewProtocol>%s</NewProtocol>"+
 			"<NewInternalPort>%d</NewInternalPort><NewInternalClient>%s</NewInternalClient><NewEnabled>1</NewEnabled>"+
 			"<NewPortMappingDescription>RemoteSession</NewPortMappingDescription><NewLeaseDuration>%d</NewLeaseDuration>",
-			port, internal, local, int(lease/time.Second))
+			port, proto, internal, local, int(lease/time.Second))
 		_, err := soap(ctx, control, svc.Type, "AddPortMapping", args)
 		return err
 	}
@@ -298,7 +306,7 @@ func mapUPnP(ctx context.Context, local netip.Addr, internal, want int) (*PortMa
 		renew: func(ctx context.Context) error { return add(port, lease) },
 		remove: func(ctx context.Context) error {
 			_, err := soap(ctx, control, svc.Type, "DeletePortMapping",
-				fmt.Sprintf("<NewRemoteHost></NewRemoteHost><NewExternalPort>%d</NewExternalPort><NewProtocol>TCP</NewProtocol>", port))
+				fmt.Sprintf("<NewRemoteHost></NewRemoteHost><NewExternalPort>%d</NewExternalPort><NewProtocol>%s</NewProtocol>", port, proto))
 			return err
 		},
 	}, nil

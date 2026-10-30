@@ -24,10 +24,11 @@ import (
 // hello packet first. Format "s24le": the payload is interleaved 24-bit
 // little-endian PCM.
 type streamHeader struct {
-	Rate     int    `json:"rate,omitempty"`
-	Channels int    `json:"channels,omitempty"`
-	Format   string `json:"format,omitempty"`
-	Error    string `json:"error,omitempty"`
+	Rate     int       `json:"rate,omitempty"`
+	Channels int       `json:"channels,omitempty"`
+	Format   string    `json:"format,omitempty"`
+	UDP      *udpOffer `json:"udp,omitempty"`
+	Error    string    `json:"error,omitempty"`
 }
 
 const (
@@ -56,8 +57,10 @@ type Monitor struct {
 	proc    *exec.Cmd
 }
 
-// Stream sends the monitor mix to c until the client goes away.
-func (m *Monitor) Stream(ctx context.Context, c net.Conn) error {
+// Stream sends the monitor mix to c until the client goes away. With mux
+// (and Opus), it offers UDP and sends by UDP while the client's hellos
+// arrive, keeping c alive with the hello packet every 2 s.
+func (m *Monitor) Stream(ctx context.Context, c net.Conn, mux *UDPMux) error {
 	ch, rate, err := m.subscribe()
 	if err != nil {
 		b, _ := json.Marshal(streamHeader{Error: err.Error()})
@@ -75,7 +78,15 @@ func (m *Monitor) Stream(ctx context.Context, c net.Conn) error {
 			rate = f.Rate
 		}
 	}
-	b, _ := json.Marshal(streamHeader{Rate: rate, Channels: 2, Format: format})
+	hdrOut := streamHeader{Rate: rate, Channels: 2, Format: format}
+	var peer *udpPeer
+	if hello != nil && mux != nil {
+		var offer udpOffer
+		peer, offer = mux.register()
+		defer mux.unregister(peer)
+		hdrOut.UDP = &offer
+	}
+	b, _ := json.Marshal(hdrOut)
 	if _, err := c.Write(append(b, '\n')); err != nil {
 		return err
 	}
@@ -85,6 +96,7 @@ func (m *Monitor) Stream(ctx context.Context, c net.Conn) error {
 		}
 	}
 	var hdr [4]byte
+	var lastTCP time.Time
 	for {
 		select {
 		case <-ctx.Done():
@@ -94,6 +106,16 @@ func (m *Monitor) Stream(ctx context.Context, c net.Conn) error {
 				return errors.New("monitor capture stopped")
 			}
 			c.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if peer != nil && peer.usable() && mux.send(peer, buf) == nil {
+				if time.Since(lastTCP) > 2*time.Second { // keep the TCP side alive
+					if _, err := c.Write(hello); err != nil {
+						return err
+					}
+					lastTCP = time.Now()
+				}
+				continue
+			}
+			lastTCP = time.Now()
 			if hello != nil {
 				if _, err := c.Write(buf); err != nil { // already framed
 					return err

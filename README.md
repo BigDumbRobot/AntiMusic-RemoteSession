@@ -90,7 +90,7 @@ bin/rsession record -device "Pro Tools Audio Bridge 2-A" -dir takes/home1 -ptsl 
 # client: bin/rsession join -code <code> -dir prints -listen   (type to chat)
 # If the link drops, recording carries on; finish or re-send any take with:
 bin/rsession send -dir takes/home1 -code 8RC4TK-8WX0K7-GDZCFA
-# Router won't open ports: forward TCP 7400 yourself and add -public <your IP>,
+# Router won't open ports: forward TCP 7400 (and UDP 7400 for low-latency listening) yourself and add -public <your IP>,
 # or run an optional rs-relay and use -relay host:port on both sides.
 
 # Post-processing print through a plugin chain:
