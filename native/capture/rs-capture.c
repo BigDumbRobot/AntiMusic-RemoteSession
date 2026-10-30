@@ -21,7 +21,11 @@
 // the device's output channel count, through the same IOProc, so a
 // loopback device can be verified with a single client and clock.
 //
-// stderr: first line is a JSON header {"rate":..,"channels":..,...};
+// --buffer FRAMES asks for this process's IO buffer size (CoreAudio
+// keeps one per client; another app's setting does not change ours).
+//
+// stderr: first line is a JSON header {"rate":..,"channels":..,"buffer":..,
+// "input_latency":..,...} (latencies and offsets in frames);
 // diagnostics follow. Exit status: 0 on SIGINT/SIGTERM or stdout closed,
 // 1 on setup errors, 3 if the device stops, changes rate or disappears.
 #include <CoreAudio/CoreAudio.h>
@@ -145,8 +149,8 @@ static int get_string(AudioObjectID id, AudioObjectPropertySelector sel, char *b
     return ok ? 0 : -1;
 }
 
-static int input_channels(AudioObjectID id) {
-    AudioObjectPropertyAddress a = {kAudioDevicePropertyStreamConfiguration, kAudioObjectPropertyScopeInput, kAudioObjectPropertyElementMain};
+static int scope_channels(AudioObjectID id, AudioObjectPropertyScope scope) {
+    AudioObjectPropertyAddress a = {kAudioDevicePropertyStreamConfiguration, scope, kAudioObjectPropertyElementMain};
     UInt32 size = 0;
     if (AudioObjectGetPropertyDataSize(id, &a, 0, NULL, &size) != noErr || size == 0) return 0;
     AudioBufferList *bl = malloc(size);
@@ -156,6 +160,8 @@ static int input_channels(AudioObjectID id) {
     free(bl);
     return n;
 }
+
+static int input_channels(AudioObjectID id) { return scope_channels(id, kAudioObjectPropertyScopeInput); }
 
 static double nominal_rate(AudioObjectID id) {
     AudioObjectPropertyAddress a = {kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
@@ -226,18 +232,39 @@ static int write_all(int fd, const void *p, size_t n) {
     return 0;
 }
 
+// scope_u32 reads a UInt32 device property in one scope (0 if absent).
+static UInt32 scope_u32(AudioObjectID dev, AudioObjectPropertySelector sel, AudioObjectPropertyScope scope) {
+    AudioObjectPropertyAddress a = {sel, scope, kAudioObjectPropertyElementMain};
+    UInt32 v = 0, size = sizeof v;
+    if (AudioObjectGetPropertyData(dev, &a, 0, NULL, &size, &v) != noErr) return 0;
+    return v;
+}
+
+// stream_latency is the first stream's own latency in one scope.
+static UInt32 stream_latency(AudioObjectID dev, AudioObjectPropertyScope scope) {
+    AudioObjectPropertyAddress a = {kAudioDevicePropertyStreams, scope, kAudioObjectPropertyElementMain};
+    UInt32 size = 0;
+    if (AudioObjectGetPropertyDataSize(dev, &a, 0, NULL, &size) != noErr || size < sizeof(AudioStreamID)) return 0;
+    AudioStreamID st[64];
+    if (size > sizeof st) size = sizeof st;
+    if (AudioObjectGetPropertyData(dev, &a, 0, NULL, &size, st) != noErr) return 0;
+    return scope_u32(st[0], kAudioStreamPropertyLatency, kAudioObjectPropertyScopeGlobal);
+}
+
 int main(int argc, char **argv) {
     const char *want = NULL, *log_path = NULL, *play_path = NULL;
     int list = 0;
     double ring_seconds = 8;
+    UInt32 buffer_frames = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--list")) list = 1;
         else if (!strcmp(argv[i], "--device") && i + 1 < argc) want = argv[++i];
         else if (!strcmp(argv[i], "--log") && i + 1 < argc) log_path = argv[++i];
         else if (!strcmp(argv[i], "--ring-seconds") && i + 1 < argc) ring_seconds = atof(argv[++i]);
         else if (!strcmp(argv[i], "--play") && i + 1 < argc) play_path = argv[++i];
+        else if (!strcmp(argv[i], "--buffer") && i + 1 < argc) buffer_frames = (UInt32)atoi(argv[++i]);
         else {
-            fprintf(stderr, "usage: rs-capture --list | --device NAME|UID [--log FILE] [--ring-seconds N]\n");
+            fprintf(stderr, "usage: rs-capture --list | --device NAME|UID [--log FILE] [--ring-seconds N] [--buffer FRAMES]\n");
             return 1;
         }
     }
@@ -256,7 +283,8 @@ int main(int argc, char **argv) {
             json_string(stdout, name);
             printf(",\"uid\":");
             json_string(stdout, uid);
-            printf(",\"channels\":%d,\"rate\":%.0f}\n", ch, nominal_rate(ids[i]));
+            printf(",\"channels\":%d,\"outputs\":%d,\"rate\":%.0f}\n", ch,
+                   scope_channels(ids[i], kAudioObjectPropertyScopeOutput), nominal_rate(ids[i]));
         } else if (want && (!strcmp(want, name) || !strcmp(want, uid))) {
             dev = ids[i];
             break;
@@ -320,11 +348,28 @@ int main(int argc, char **argv) {
     signal(SIGTERM, on_signal);
     signal(SIGPIPE, SIG_IGN);
 
+
+    // --buffer asks for this process's IO buffer size (each client has its own).
+    UInt32 buf = buffer_frames;
+    AudioObjectPropertyAddress ba = {kAudioDevicePropertyBufferFrameSize, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+    if (buffer_frames && AudioObjectSetPropertyData(dev, &ba, 0, NULL, sizeof buf, &buf) != noErr)
+        fprintf(stderr, "rs-capture: cannot set buffer to %u frames\n", buffer_frames);
+    UInt32 bsz = sizeof buf;
+    if (AudioObjectGetPropertyData(dev, &ba, 0, NULL, &bsz, &buf) != noErr) buf = 0;
+
+    // Header. input_latency is what the IOProc's input timestamps do not
+    // include: the device's reported latency plus the input stream's.
+    // The safety offset and buffer are already inside the timestamps.
     fprintf(stderr, "{\"rate\":%.0f,\"channels\":%d,\"name\":", rate, g.channels);
     json_string(stderr, name);
     fprintf(stderr, ",\"uid\":");
     json_string(stderr, uid);
-    fprintf(stderr, "}\n");
+    fprintf(stderr, ",\"buffer\":%u,\"input_latency\":%u,\"input_safety_offset\":%u,\"output_latency\":%u,\"output_safety_offset\":%u}\n",
+            buf,
+            scope_u32(dev, kAudioDevicePropertyLatency, kAudioDevicePropertyScopeInput) + stream_latency(dev, kAudioDevicePropertyScopeInput),
+            scope_u32(dev, kAudioDevicePropertySafetyOffset, kAudioDevicePropertyScopeInput),
+            scope_u32(dev, kAudioDevicePropertyLatency, kAudioDevicePropertyScopeOutput) + stream_latency(dev, kAudioDevicePropertyScopeOutput),
+            scope_u32(dev, kAudioDevicePropertySafetyOffset, kAudioDevicePropertyScopeOutput));
 
     AudioDeviceIOProcID proc;
     if (AudioDeviceCreateIOProcID(dev, io_proc, NULL, &proc) != noErr || AudioDeviceStart(dev, proc) != noErr) {

@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"antimusic.dev/remotesession/internal/deliver"
+	"antimusic.dev/remotesession/internal/latency"
 	"antimusic.dev/remotesession/internal/link"
 	"antimusic.dev/remotesession/internal/pair"
 	"antimusic.dev/remotesession/internal/ptsl"
@@ -39,6 +40,7 @@ const usage = `usage: rsession <command> [flags]
 
 commands:
   devices        list CoreAudio input devices
+  latency        measure an interface's round trip with a loopback cable and compare it with what the device reports
   record         record a lossless master, journaling DAW transport
   deliver        render placed BWF deliverables from a take and verify them
   links          list RemoteSession Link plugin instances (-watch <track> for live diagnostics)
@@ -58,6 +60,8 @@ func main() {
 	switch cmd, args := os.Args[1], os.Args[2:]; cmd {
 	case "devices":
 		err = devices()
+	case "latency":
+		err = latencyCmd(args)
 	case "record":
 		err = record(args)
 	case "deliver":
@@ -95,7 +99,8 @@ func record(args []string) error {
 	device := fs.String("device", "", "CoreAudio input device name or UID (see rsession devices)")
 	linkSel := fs.String("link", "", "record a RemoteSession Link plugin instance (track name or .rslink path) with exact transport stamps")
 	dir := fs.String("dir", "", "take directory to create")
-	latency := fs.Int64("latency", 0, "capture-path latency in frames (measured)")
+	latency := fs.Int64("latency", -1, "capture-path latency in frames; -1 uses the device's reported input latency")
+	buffer := fs.Int("buffer", 0, "ask for this IO buffer size in frames (0 keeps the device's)")
 	codec := fs.String("codec", "pcm_f32le", "master codec: pcm_f32le (bit-exact device float) or pcm_s24le")
 	usePTSL := fs.Bool("ptsl", false, "read session and journal transport from Pro Tools via PTSL")
 	addr := fs.String("ptsl-addr", ptsl.DefaultAddress, "PTSL address")
@@ -113,7 +118,7 @@ func record(args []string) error {
 		return fmt.Errorf("record: %s already exists; pick a new take directory", *dir)
 	}
 	if *code == "" {
-		return recordTake(*dir, *device, *linkSel, *latency, *codec, *usePTSL, *addr, *poll, *rate, *start, *fps)
+		return recordTake(*dir, *device, *linkSel, *latency, *buffer, *codec, *usePTSL, *addr, *poll, *rate, *start, *fps)
 	}
 
 	s, resume, err := newSender(*dir, *code, *relay)
@@ -142,7 +147,7 @@ func record(args []string) error {
 		}
 		res, serr = s.Run(sctx)
 	}()
-	rerr := recordTake(*dir, *device, *linkSel, *latency, *codec, *usePTSL, *addr, *poll, *rate, *start, *fps)
+	rerr := recordTake(*dir, *device, *linkSel, *latency, *buffer, *codec, *usePTSL, *addr, *poll, *rate, *start, *fps)
 	if _, err := os.Stat(filepath.Join(*dir, take.ManifestFile)); err != nil {
 		scancel() // the recording never started
 	} else {
@@ -166,7 +171,7 @@ func record(args []string) error {
 	return rerr
 }
 
-func recordTake(dir, device, linkSel string, latency int64, codec string, usePTSL bool, addr string,
+func recordTake(dir, device, linkSel string, latency int64, buffer int, codec string, usePTSL bool, addr string,
 	poll time.Duration, rate int, start, fps string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -199,12 +204,21 @@ func recordTake(dir, device, linkSel string, latency int64, codec string, usePTS
 	}
 	r, err := recorder.Start(recorder.Config{
 		Dir: dir, Device: device,
-		MasterCodec: codec, LatencyFrames: latency, Session: sess,
+		MasterCodec: codec, LatencyFrames: max(latency, 0), AutoLatency: latency < 0,
+		BufferFrames: buffer, Session: sess,
 	})
 	if err != nil {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "recording %s -> %s (Ctrl-C to stop)\n", device, filepath.Join(dir, take.MasterFile))
+	if m, err := take.ReadManifest(dir); err == nil {
+		if m.Device != nil {
+			fmt.Fprintf(os.Stderr, "device: buffer %d, input latency %d frames (%s)\n", m.Device.Buffer, m.LatencyFrames, latencyNote(m))
+		}
+		if w := rateWarning(m); w != "" {
+			fmt.Fprintln(os.Stderr, w)
+		}
+	}
 
 	if client != nil {
 		w := &transport.PTSLWatcher{
@@ -1140,4 +1154,96 @@ func recordLink(ctx context.Context, sel, dir, codec string, sess *take.Session)
 		return perr
 	}
 	return werr
+}
+
+func latencyNote(m *take.Manifest) string {
+	if m.LatencySource == "device" {
+		return "reported by the device"
+	}
+	return "set with -latency"
+}
+
+// rateWarning flags a take that cannot be delivered as recorded because
+// the device and the session run at different sample rates. Recording
+// carries on (the master is still lossless); delivery refuses it.
+func rateWarning(m *take.Manifest) string {
+	if m.Session == nil || m.Session.SampleRate == 0 || m.SampleRate == 0 || m.Session.SampleRate == m.SampleRate {
+		return ""
+	}
+	return fmt.Sprintf("WARNING: the device runs at %d Hz but the session is %d Hz. This take cannot be delivered "+
+		"until they match; stop, set the device to %d Hz, and record again.", m.SampleRate, m.Session.SampleRate, m.Session.SampleRate)
+}
+
+func latencyCmd(args []string) error {
+	fs := flag.NewFlagSet("latency", flag.ExitOnError)
+	device := fs.String("device", "", "interface name or UID (see rsession devices)")
+	out := fs.Int("out", 0, "output channel the loopback starts from (1-based)")
+	in := fs.Int("in", 0, "input channel it comes back on (1-based)")
+	buffer := fs.Int("buffer", 0, "IO buffer size to measure at (0 keeps the device's)")
+	level := fs.Float64("level", -12, "click level in dBFS (at most -6)")
+	clicks := fs.Int("clicks", 8, "number of clicks, 250 ms apart")
+	asJSON := fs.Bool("json", false, "print the result as JSON")
+	fs.Parse(args)
+	if *device == "" || *out == 0 || *in == 0 {
+		return errors.New("latency: -device, -out and -in are required. Patch output -out to input -in first; " +
+			"only that output plays, a few clicks at -12 dBFS")
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if !*asJSON {
+		fmt.Fprintf(os.Stderr, "playing %d clicks on output %d, listening on input %d...\n", *clicks, *out, *in)
+	}
+	r, err := latency.Measure(ctx, latency.Config{Device: *device, Out: *out, In: *in, Buffer: *buffer,
+		LevelDB: *level, Clicks: *clicks, Helper: recorder.FindCaptureHelper()})
+	if *asJSON && r != nil {
+		v := struct {
+			*latency.Result
+			Difference int    `json:"difference"`
+			Matches    bool   `json:"matches"`
+			Error      string `json:"error,omitempty"`
+		}{Result: r, Difference: r.Difference(), Matches: r.Matches()}
+		if err != nil {
+			v.Error = err.Error()
+		}
+		b, _ := json.MarshalIndent(v, "", "  ")
+		fmt.Println(string(b))
+		return err
+	}
+	if err != nil {
+		return err
+	}
+	ms := func(f int) float64 { return float64(f) * 1000 / float64(r.Rate) }
+	rep := r.Reported
+	fmt.Printf("%s, %d Hz, buffer %d\n", r.Device, r.Rate, rep.Buffer)
+	fmt.Printf("round trip  %d frames (%.2f ms), %d of %d clicks, spread %d\n",
+		r.RoundTrip, ms(r.RoundTrip), len(r.Clicks), r.Sent, r.Spread)
+	fmt.Printf("predicted   %d frames = 2 x %d buffer + in %d + %d safety + out %d + %d safety\n",
+		r.Predicted, rep.Buffer, rep.InputLatency, rep.InputSafetyOffset, rep.OutputLatency, rep.OutputSafetyOffset)
+	pol := ""
+	if r.Inverted {
+		pol = ", polarity inverted"
+	}
+	fmt.Printf("loop gain   %+.1f dB%s\n", r.GainDB, pol)
+	if len(r.AlsoOn) > 0 {
+		fmt.Printf("also heard on inputs %v (routing or crosstalk)\n", r.AlsoOn)
+	}
+	switch d := r.Difference(); {
+	case r.Matches():
+		fmt.Printf("OK: within %d frames of the device's own figures; recordings use its input latency (%d frames).\n", abs(d), rep.InputLatency)
+	default:
+		fmt.Printf("MISMATCH: %+d frames (%.2f ms) from the device's own figures. Recordings would be off by up to that much\n"+
+			"until the interface next locks its clock (e.g. a sample-rate change). A loopback cannot tell whether the input or\n"+
+			"the output side is off; if it is the input, record with -latency %d.\n", d, ms(abs(d)), max(rep.InputLatency+d, 0))
+	}
+	if r.Spread > 1 {
+		fmt.Println("note: the clicks did not all come back at the same delay; something in the loop is not fixed-latency.")
+	}
+	return nil
+}
+
+func abs(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
 }

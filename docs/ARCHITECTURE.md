@@ -328,18 +328,77 @@ values checked, prints back; 5 runs clean under the race detector). A CLI
 session between two processes on one Mac did the same, with prints arriving
 byte-identical at their recorded positions (session +43852, +79835).
 
+### 10. Capture latency comes from the device; a loopback checks it
+
+`rs-capture` reports the device's figures in its header (buffer, input and
+output latency, safety offsets) and every take stores them (`device` in
+`take.json`). The IOProc's input timestamps already include the buffer and
+the input safety offset, so the part they miss is the device and stream
+latency: `record` uses that as `latency_frames` unless `-latency` is given
+(`latency_source` says which). Audio Bridge reports 0, so bridge takes are
+unchanged. `rs-capture --buffer N` asks for this client's IO buffer size;
+CoreAudio keeps one per client, so Pro Tools' setting does not change ours.
+
+`rsession latency -device D -out N -in M` plays eight single-sample clicks
+(-12 dBFS, only on output N) and records input M in the same IOProc, so
+both ends share one clock. It reports the round trip, CoreAudio's
+prediction (2 × buffer + latencies + safety offsets), loop gain, polarity
+and any other input the clicks leak into. A device restart while
+measuring is retried.
+
+Evidence (2026-10-30), Apogee Symphony I/O over USB, 48 kHz, analog loop
+out 3 → compressor → in 3, Pro Tools open or closed:
+
+| Clock lock | 512 buffer (predicted 1292) | 128 buffer (predicted 524) |
+|---|---|---|
+| as found this morning | 1292 | not measured |
+| later, no rate change seen | 1290 | 522 |
+| after 44.1 → 48 kHz switches | 1291, 1283-1285 | 523, 515 |
+
+- Within one lock the round trip is constant to the sample: every click,
+  every run, across device starts and buffer changes (clicks every 250 ms
+  for 20 s; repeated starts at 512 and 128).
+- The offset from the prediction changes only when the interface locks its
+  clock again. A rate change can land on any of the values above. The
+  Symphony sometimes resets its clock again on its own seconds after a
+  change, which `rs-capture` sees as a clock jump and stops on. It can also
+  re-lock minutes later while idle: after holding at -9 through ten runs,
+  a check some minutes later read 1290 again. Restarting the stream
+  or changing the buffer does not change the offset.
+- For the first second after a start the Symphony's input is silent, so
+  clicks start 1.5 s in.
+- A loopback measures input plus output; it cannot say which side the
+  difference is on.
+
+Conclusion: the device's own figure is good to 0.19 ms on this interface.
+That is the default because it needs no cable. A studio that wants it
+exact runs `rsession latency` (or the app's Latency check) once the
+interface has settled after a sample-rate change, and records with the
+suggested `-latency`, which holds until the next lock. The app's Studio tab
+runs the same check; `record` shows a sample-rate mismatch in the app's
+record status.
+
+### 11. The master is forced to disk every second
+
+FFmpeg and `rs-capture` only write; the recorder now runs `F_FULLFSYNC`
+(Go's `File.Sync` on macOS, which also flushes the drive's cache) on the
+master and the capture log every second and once at the end, so a power
+loss loses at most about a second. The transport log was already synced
+per event.
+
 ## Blockers and risks
 
 1. **The Link AAX is unsigned.** It loads and is verified in the Pro Tools
    Developer build (section 7). Retail Pro Tools rejects it until it is
    signed with PACE tools (request via audiosdk@avid.com).
-2. **Capture-path latency** (`latency_frames`) is configurable but not yet
-   measured per interface. It needs a round-trip measurement with the real
-   interface, and `GetSessionSystemDelayInfo` is available to help.
-3. **Durability on power loss**: no fsync of the master yet (see 2).
-4. **Sample-rate mismatch** between device and session is refused at delivery
-   rather than resampled. This is deliberate, but there is no UI warning at
-   record time yet.
+2. **Capture-path latency** now defaults to the device's reported input
+   latency (section 10). On the Symphony that figure is off by 0 to 9
+   frames (at most 0.19 ms) depending on the clock lock, and
+   `rsession latency` with a loopback cable is the only way to see by how
+   much.
+3. **Sample-rate mismatch** between device and session is still refused at
+   delivery rather than resampled (deliberate). `record` now warns as soon
+   as the take starts, while it can still be redone.
 
 ## Not started (by design, per the phase plan)
 

@@ -66,8 +66,24 @@ type Manifest struct {
 	Error       string   `json:"error,omitempty"`
 	// LatencyFrames is the capture-path latency used when placing the
 	// master (see timeline.Segments).
-	LatencyFrames int64    `json:"latency_frames"`
-	Session       *Session `json:"session,omitempty"`
+	LatencyFrames int64 `json:"latency_frames"`
+	// LatencySource says where LatencyFrames came from: "device" (the
+	// capture device's reported input latency), "manual", or "" (none).
+	LatencySource string         `json:"latency_source,omitempty"`
+	Device        *DeviceLatency `json:"device,omitempty"`
+	Session       *Session       `json:"session,omitempty"`
+}
+
+// DeviceLatency is what the capture device reported when the take
+// started, in frames. InputLatency is the part the capture timestamps do
+// not include (device plus stream latency); the buffer and safety offsets
+// are already inside them.
+type DeviceLatency struct {
+	Buffer             int `json:"buffer"`
+	InputLatency       int `json:"input_latency"`
+	InputSafetyOffset  int `json:"input_safety_offset"`
+	OutputLatency      int `json:"output_latency"`
+	OutputSafetyOffset int `json:"output_safety_offset"`
 }
 
 // Event is one transport observation. Either Frame (exact, from a source

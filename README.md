@@ -58,7 +58,12 @@ notarization remove that step).
 ## Use
 
 ```sh
-bin/rsession devices                                   # CoreAudio inputs (name, UID, channels, rate)
+bin/rsession devices                                   # CoreAudio inputs (name, UID, channels, outputs, rate)
+
+# Check an interface's latency with a loopback cable (out 3 patched to in 3).
+# Only output 3 plays: eight clicks at -12 dBFS. Recordings use the device's
+# reported input latency by default; this shows whether it holds.
+bin/rsession latency -device "Symphony I/O : USB Audio" -out 3 -in 3 [-buffer 128]
 
 # Record against the open Pro Tools session (transport journaled via PTSL):
 bin/rsession record -device "Pro Tools Audio Bridge 16" -dir takes/take1 -ptsl
@@ -107,6 +112,7 @@ bin/ptslverify -dir /tmp/rs-verify    # needs Pro Tools running; makes and disca
 | `native/render/` | `rs-render`, offline AU/VST3 chain renderer (JUCE) |
 | `native/link/` | RemoteSession Link plugin and its shared-memory ring format |
 | `internal/link` | reader for the Link plugin's ring |
+| `internal/latency` | loopback round-trip measurement against the device's reported latency |
 | `internal/recorder` | starts the capture helper and FFmpeg, writes the take journal |
 | `internal/take` | take directory format |
 | `internal/timeline` | transport events → placed segments, timecode, capture clock |

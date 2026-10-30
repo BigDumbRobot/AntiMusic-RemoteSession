@@ -434,6 +434,7 @@ final class Client: ObservableObject {
                   stdout: { _ in },
                   stderr: { [weak self] l in
                       if l.hasPrefix("rsession: ") { lastLine = String(l.dropFirst(10)) }
+                      if l.hasPrefix("WARNING: ") { self?.recordStatus = String(l.dropFirst(9)) }
                       if l.contains("retrying") { self?.recordStatus = "Studio not reachable; recording locally and retrying…" }
                   },
                   exit: { [weak self] status, _ in
@@ -450,6 +451,115 @@ final class Client: ObservableObject {
         recordStatus = "Finishing the upload…"
         rec.stopping = true
         rec.process.interrupt()
+    }
+}
+
+// MARK: - Latency check (studio, with a loopback cable)
+
+final class LatencyCheck: ObservableObject {
+    struct Interface: Hashable { let name: String; let uid: String; let inputs: Int; let outputs: Int }
+    @Published var interfaces: [Interface] = []
+    @Published var uid = UserDefaults.standard.string(forKey: "latencyDevice") ?? ""
+    @Published var out = max(UserDefaults.standard.integer(forKey: "latencyOut"), 1)
+    @Published var input = max(UserDefaults.standard.integer(forKey: "latencyIn"), 1)
+    @Published var running = false
+    @Published var result = ""
+    @Published var detail = ""
+    @Published var ok: Bool?
+
+    var selected: Interface? { interfaces.first { $0.uid == uid } }
+
+    func refresh() {
+        interfaces = Tool.output(["devices"]).split(separator: "\n").compactMap { line in
+            guard let o = parse(String(line)), let name = o["name"] as? String, let uid = o["uid"] as? String,
+                  let ins = o["channels"] as? Int, let outs = o["outputs"] as? Int, outs > 0,
+                  !name.hasPrefix("Pro Tools Audio Bridge") else { return nil }
+            return Interface(name: name, uid: uid, inputs: ins, outputs: outs)
+        }
+        if selected == nil { uid = interfaces.first?.uid ?? "" }
+    }
+
+    func run() {
+        guard let dev = selected, !running else { return }
+        UserDefaults.standard.set(uid, forKey: "latencyDevice")
+        UserDefaults.standard.set(out, forKey: "latencyOut")
+        UserDefaults.standard.set(input, forKey: "latencyIn")
+        running = true
+        ok = nil
+        result = "Playing clicks on output \(out), listening on input \(input)…"
+        detail = ""
+        let args = ["latency", "-json", "-device", dev.uid, "-out", String(out), "-in", String(input)]
+        DispatchQueue.global().async {
+            let text = Tool.output(args)
+            DispatchQueue.main.async { self.show(text) }
+        }
+    }
+
+    private func show(_ text: String) {
+        running = false
+        guard let r = parse(text.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+            result = "The check did not run. Is the interface connected?"
+            return
+        }
+        if let e = r["error"] as? String, !e.isEmpty {
+            ok = false
+            result = e.replacingOccurrences(of: "latency: ", with: "").prefix(1).uppercased()
+                + e.replacingOccurrences(of: "latency: ", with: "").dropFirst()
+            return
+        }
+        let rate = Double(r["rate"] as? Int ?? 48000)
+        let rt = r["round_trip"] as? Int ?? 0
+        let diff = r["difference"] as? Int ?? 0
+        let rep = r["reported"] as? [String: Any] ?? [:]
+        let inLat = rep["input_latency"] as? Int ?? 0
+        ok = r["matches"] as? Bool ?? false
+        let ms = String(format: "%.2f", Double(rt) * 1000 / rate)
+        if ok == true {
+            result = "Round trip \(rt) samples (\(ms) ms). Matches what the interface reports."
+            detail = "Recordings use its input latency (\(inLat) samples) as is."
+        } else {
+            let off = String(format: "%.2f", Double(abs(diff)) * 1000 / rate)
+            result = "Round trip \(rt) samples (\(ms) ms), \(diff > 0 ? "+" : "")\(diff) from what the interface reports (\(off) ms)."
+            detail = "This holds until the interface next changes sample rate. If the input side is off, record with -latency \(max(inLat + diff, 0))."
+        }
+        var notes: [String] = []
+        if let g = r["gain_db"] as? Double { notes.append(String(format: "loop gain %+.1f dB", g)) }
+        if r["inverted"] as? Bool ?? false { notes.append("polarity inverted") }
+        if let also = r["also_on"] as? [Int], !also.isEmpty { notes.append("also heard on input " + also.map(String.init).joined(separator: ", ")) }
+        if !notes.isEmpty { detail += (detail.isEmpty ? "" : " ") + notes.joined(separator: " · ").prefix(1).uppercased() + notes.joined(separator: " · ").dropFirst() + "." }
+    }
+}
+
+struct LatencyPanel: View {
+    @ObservedObject var check: LatencyCheck
+    var body: some View {
+        Panel(title: "LATENCY CHECK", accent: Neon.purple) {
+            GlowText(text: "Optional. Patch one output straight back into one input; only that output plays a few quiet clicks.",
+                     color: Neon.dim, size: 12)
+            HStack(spacing: 10) {
+                Picker("", selection: $check.uid) {
+                    ForEach(check.interfaces, id: \.uid) { d in Text(d.name).tag(d.uid) }
+                }.labelsHidden().frame(maxWidth: 240)
+                Stepper("Out \(check.out)", value: $check.out, in: 1...max(check.selected?.outputs ?? 1, 1))
+                    .foregroundColor(Neon.ice).fixedSize()
+                Stepper("In \(check.input)", value: $check.input, in: 1...max(check.selected?.inputs ?? 1, 1))
+                    .foregroundColor(Neon.ice).fixedSize()
+                Spacer()
+                Button { check.run() } label: { Label(check.running ? "Checking…" : "Check", systemImage: "waveform.path") }
+                    .buttonStyle(NeonButton(color: Neon.purple, filled: true))
+                    .disabled(check.running || check.selected == nil)
+            }
+            if !check.result.isEmpty {
+                HStack(alignment: .top, spacing: 8) {
+                    StatusDot(color: check.ok == nil ? .gray : (check.ok! ? Neon.cyan : Neon.yellow)).padding(.top, 4)
+                    VStack(alignment: .leading, spacing: 3) {
+                        GlowText(text: check.result, color: .white, size: 12)
+                        if !check.detail.isEmpty { GlowText(text: check.detail, color: Neon.dim, size: 11) }
+                    }
+                }
+            }
+        }
+        .onAppear { check.refresh() }
     }
 }
 
@@ -653,6 +763,7 @@ struct StatusDot: View {
 
 struct StudioView: View {
     @ObservedObject var studio: Studio
+    @StateObject private var latency = LatencyCheck()
     @State private var copied = ""
 
     var dot: Color {
@@ -750,6 +861,8 @@ struct StudioView: View {
                     Button("Show in Finder") { NSWorkspace.shared.open(studio.folder) }.buttonStyle(NeonButton(color: Neon.purple))
                 }
             }
+
+            LatencyPanel(check: latency)
         }
         .onAppear { studio.start() }
     }

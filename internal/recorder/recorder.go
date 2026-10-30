@@ -59,7 +59,16 @@ type Config struct {
 	MasterCodec   string
 	FFmpeg        string
 	LatencyFrames int64
-	Session       *take.Session
+	// AutoLatency uses the capture device's reported input latency
+	// instead of LatencyFrames (Device only).
+	AutoLatency bool
+	// BufferFrames asks rs-capture for this IO buffer size (0: keep).
+	BufferFrames int
+	Session      *take.Session
+	// SyncInterval is how often the master and capture log are forced to
+	// disk (F_FULLFSYNC), bounding what a power loss can take. 0 means 1 s;
+	// negative disables it.
+	SyncInterval time.Duration
 }
 
 // Recorder is a running capture.
@@ -126,6 +135,11 @@ func Start(cfg Config) (*Recorder, error) {
 		stdin = out
 		r.manifest.Input = []string{"rs-capture", hdr.Name, hdr.UID}
 		r.manifest.SampleRate, r.manifest.Channels = hdr.Rate, hdr.Channels
+		r.manifest.Device = &take.DeviceLatency{Buffer: hdr.Buffer, InputLatency: hdr.InputLatency,
+			InputSafetyOffset: hdr.InputSafetyOffset, OutputLatency: hdr.OutputLatency, OutputSafetyOffset: hdr.OutputSafetyOffset}
+		if cfg.AutoLatency {
+			r.manifest.LatencyFrames, r.manifest.LatencySource = int64(hdr.InputLatency), "device"
+		}
 		args = append(args, "-f", "f32le", "-ar", strconv.Itoa(hdr.Rate), "-ac", strconv.Itoa(hdr.Channels), "-i", "pipe:0")
 	} else if cfg.Stream != nil {
 		stdin = cfg.Stream
@@ -140,6 +154,9 @@ func Start(cfg Config) (*Recorder, error) {
 	}
 	args = append(args, "-map", "0:a:0", "-c:a", cfg.MasterCodec, "-flush_packets", "1", "-f", "caf", master)
 
+	if r.manifest.LatencySource == "" && cfg.LatencyFrames != 0 {
+		r.manifest.LatencySource = "manual"
+	}
 	var err error
 	if r.Events, err = take.OpenEventLog(cfg.Dir); err != nil {
 		r.killCapture()
@@ -161,7 +178,53 @@ func Start(cfg Config) (*Recorder, error) {
 		c.Close() // FFmpeg holds its own copy of the capture pipe
 	}
 	go r.wait()
+	if cfg.SyncInterval >= 0 {
+		iv := cfg.SyncInterval
+		if iv == 0 {
+			iv = time.Second
+		}
+		go syncLoop(iv, r.done, master, clog)
+	}
 	return r, nil
+}
+
+// syncLoop forces the files FFmpeg and rs-capture write to stable
+// storage every interval and once more when recording ends. They only
+// write (no fsync of their own), so without this a power loss can drop
+// whatever the OS still holds in its cache. Go's File.Sync is
+// F_FULLFSYNC on macOS, which also flushes the drive's cache.
+func syncLoop(every time.Duration, done <-chan struct{}, paths ...string) {
+	files := make([]*os.File, len(paths))
+	defer func() {
+		for _, f := range files {
+			if f != nil {
+				f.Close()
+			}
+		}
+	}()
+	sync := func() {
+		for i, p := range paths {
+			if files[i] == nil {
+				f, err := os.Open(p) // fsync acts on the file, not the descriptor
+				if err != nil {
+					continue // not created yet
+				}
+				files[i] = f
+			}
+			files[i].Sync()
+		}
+	}
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			sync()
+		case <-done:
+			sync()
+			return
+		}
+	}
 }
 
 type captureHeader struct {
@@ -169,6 +232,12 @@ type captureHeader struct {
 	Channels int    `json:"channels"`
 	Name     string `json:"name"`
 	UID      string `json:"uid"`
+
+	Buffer             int `json:"buffer"`
+	InputLatency       int `json:"input_latency"`
+	InputSafetyOffset  int `json:"input_safety_offset"`
+	OutputLatency      int `json:"output_latency"`
+	OutputSafetyOffset int `json:"output_safety_offset"`
 }
 
 // startCapture launches rs-capture and reads its JSON header. The
@@ -183,7 +252,11 @@ func startCapture(cfg Config, logPath string, diag io.Writer) (*exec.Cmd, *os.Fi
 	if err != nil {
 		return nil, nil, hdr, err
 	}
-	cmd := exec.Command(helper, append([]string{"--device", cfg.Device, "--log", logPath}, cfg.CaptureArgs...)...)
+	hargs := []string{"--device", cfg.Device, "--log", logPath}
+	if cfg.BufferFrames > 0 {
+		hargs = append(hargs, "--buffer", strconv.Itoa(cfg.BufferFrames))
+	}
+	cmd := exec.Command(helper, append(hargs, cfg.CaptureArgs...)...)
 	cmd.Stdout = pw
 	se, err := cmd.StderrPipe()
 	if err != nil {
