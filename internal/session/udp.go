@@ -90,6 +90,11 @@ type udpPeer struct {
 	helloN uint64       // highest hello counter seen (under mux.mu)
 	sendN  atomic.Uint64
 	rx     atomic.Bool // the last hello said UDP audio is arriving
+	// Perform sessions (client to studio audio): datagrams are audio
+	// packets for onAudio, accepted out of order within a replay window.
+	onAudio   func([]byte)
+	win       replayWindow // under mux.mu
+	lastAudio atomic.Int64 // unix nanos
 	// Stream's goroutine only:
 	started time.Time // first UDP send
 	failed  bool      // UDP audio never reached the client
@@ -124,6 +129,20 @@ func (m *UDPMux) run() {
 		ctr := binary.BigEndian.Uint64(buf[8:16])
 		m.mu.Lock()
 		p := m.peers[id]
+		if p != nil && p.onAudio != nil {
+			var pt []byte
+			if p.win.fresh(ctr) {
+				if pt, err = p.aead.Open(nil, udpNonce(dirC2S, ctr), buf[16:n], id[:]); err == nil {
+					p.win.mark(ctr)
+				}
+			}
+			m.mu.Unlock()
+			if pt != nil {
+				p.lastAudio.Store(time.Now().UnixNano())
+				p.onAudio(pt)
+			}
+			continue
+		}
 		if p == nil || ctr <= p.helloN {
 			m.mu.Unlock()
 			continue // unknown session, or a replay
@@ -142,9 +161,10 @@ func (m *UDPMux) run() {
 	}
 }
 
-// register creates a session for one listener.
-func (m *UDPMux) register() (*udpPeer, udpOffer) {
-	p := &udpPeer{key: make([]byte, 32)}
+// register creates a session for one listener, or with onAudio for a
+// client sending audio.
+func (m *UDPMux) register(onAudio func([]byte)) (*udpPeer, udpOffer) {
+	p := &udpPeer{key: make([]byte, 32), onAudio: onAudio}
 	rand.Read(p.id[:])
 	rand.Read(p.key)
 	p.aead = newAEAD(p.key)
@@ -263,6 +283,54 @@ func (u *udpClient) receiving() bool {
 func (u *udpClient) Close() error {
 	u.close.Do(func() { u.conn.Close() })
 	return nil
+}
+
+// replayWindow accepts each counter once, out of order within 64.
+type replayWindow struct {
+	top  uint64
+	bits uint64 // bit i: top-i seen
+}
+
+func (w *replayWindow) fresh(n uint64) bool {
+	if n == 0 {
+		return false
+	}
+	if n > w.top {
+		return true
+	}
+	d := w.top - n
+	return d < 64 && w.bits&(1<<d) == 0
+}
+
+func (w *replayWindow) mark(n uint64) {
+	if n > w.top {
+		shift := n - w.top
+		if shift >= 64 {
+			w.bits = 0
+		} else {
+			w.bits <<= shift
+		}
+		w.top = n
+		w.bits |= 1
+		return
+	}
+	w.bits |= 1 << (w.top - n)
+}
+
+// audioRecent reports UDP audio from the client within udpTimeout.
+func (p *udpPeer) audioRecent() bool {
+	return time.Since(time.Unix(0, p.lastAudio.Load())) < udpTimeout
+}
+
+// sendAudio seals one audio packet from the client.
+func (u *udpClient) sendAudio(p []byte) error {
+	u.n++
+	d := make([]byte, 16, 16+len(p)+u.aead.Overhead())
+	copy(d, u.id[:])
+	binary.BigEndian.PutUint64(d[8:], u.n)
+	d = u.aead.Seal(d, udpNonce(dirC2S, u.n), p, u.id[:])
+	_, err := u.conn.Write(d)
+	return err
 }
 
 // lockedWriter makes each Write (one packet) atomic between the TCP and

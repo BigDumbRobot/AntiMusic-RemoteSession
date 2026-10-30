@@ -82,7 +82,7 @@ func (m *Monitor) Stream(ctx context.Context, c net.Conn, mux *UDPMux) error {
 	var peer *udpPeer
 	if hello != nil && mux != nil {
 		var offer udpOffer
-		peer, offer = mux.register()
+		peer, offer = mux.register(nil)
 		defer mux.unregister(peer)
 		hdrOut.UDP = &offer
 	}
@@ -128,6 +128,47 @@ func (m *Monitor) Stream(ctx context.Context, c net.Conn, mux *UDPMux) error {
 			}
 		}
 	}
+}
+
+// Packets captures and encodes for one consumer (the musician's live
+// audio uses this): the Opus hello, then packets until ctx ends. Live
+// must be set.
+func (m *Monitor) Packets(ctx context.Context) (live.Packet, <-chan []byte, error) {
+	if m.Live == "" {
+		return nil, nil, errors.New("rs-live is missing")
+	}
+	ch, _, err := m.subscribe()
+	if err != nil {
+		return nil, nil, err
+	}
+	m.mu.Lock()
+	hello := m.hello
+	m.mu.Unlock()
+	if hello == nil {
+		m.unsubscribe(ch)
+		return nil, nil, errors.New("cannot encode live audio")
+	}
+	out := make(chan []byte, queueBlocks)
+	go func() {
+		defer close(out)
+		defer m.unsubscribe(ch)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case p, ok := <-ch:
+				if !ok {
+					return
+				}
+				select {
+				case out <- p:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	}()
+	return hello, out, nil
 }
 
 func (m *Monitor) subscribe() (chan []byte, int, error) {

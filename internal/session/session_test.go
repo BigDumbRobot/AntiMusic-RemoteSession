@@ -465,3 +465,74 @@ func TestListenUDP(t *testing.T) {
 	}
 	t.Logf("%d distinct packets, longest gap %d", n, g)
 }
+
+// The musician's live audio reaches the engineer by UDP, falls back to
+// TCP when UDP is cut, and returns to UDP afterwards.
+func TestPerformUDP(t *testing.T) {
+	helper, _ := filepath.Abs("../../bin/rs-live")
+	if _, err := os.Stat(helper); err != nil {
+		t.Skip("bin/rs-live not built")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	uc, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := newUDPProxy(t, uc.LocalAddr().(*net.UDPAddr))
+	mux := NewUDPMux(uc, proxy.conn.LocalAddr().(*net.UDPAddr).Port)
+	defer mux.Close()
+	studio := pair.NewCode()
+	dl := pair.ListenDirect(ctx, ln, studio, t.Logf)
+	defer dl.Close()
+
+	var got seqLog
+	var format StreamFormat
+	host := &Host{Name: "room", Takes: &xfer.Receiver{Root: t.TempDir()}, UDP: mux,
+		Perform: func(f StreamFormat) (io.WriteCloser, error) { format = f; return &got, nil },
+		Events: func(e Event) {
+			if p, ok := e["path"].(string); ok && e["type"] == "perform" {
+				got.mu.Lock()
+				got.paths = append(got.paths, p)
+				got.mu.Unlock()
+			}
+		}}
+	go host.Serve(ctx, dl)
+	code := studio.Direct(ln.Addr().(*net.TCPAddr).AddrPort())
+	guest := &Guest{Dial: func(ctx context.Context) (net.Conn, error) { return pair.Connect(ctx, "", code) },
+		Name: "Sam", Prints: &xfer.Receiver{Root: t.TempDir()}, UDPHost: netip.MustParseAddr("127.0.0.1"), Events: func(Event) {}}
+	go guest.Run(ctx)
+	src := &Monitor{Device: "fake", Channels: [2]int{1, 2}, Capture: fakeCaptureLive(t), Live: helper}
+	pctx, pcancel := context.WithCancel(ctx)
+	defer pcancel()
+	go guest.Perform(pctx, src.Packets)
+
+	waitFor(t, "udp", func() bool { return got.path() == "udp" })
+	if format.Format != "opus" || format.Rate != 48000 {
+		t.Fatalf("format %+v", format)
+	}
+	time.Sleep(time.Second)
+	if g, _ := got.maxGap(); g != 0 {
+		t.Fatalf("gap of %d packets while switching to UDP", g)
+	}
+	proxy.dropOut.Store(true) // client to studio is the audio direction
+	waitFor(t, "tcp after cut", func() bool { return got.path() == "tcp" })
+	time.Sleep(time.Second)
+	g, _ := got.maxGap()
+	if g == 0 || g > 200 {
+		t.Fatalf("gap of %d packets on a cut", g)
+	}
+	proxy.dropOut.Store(false)
+	waitFor(t, "udp after outage", func() bool { return got.path() == "udp" })
+	time.Sleep(time.Second)
+	g2, n := got.maxGap()
+	if g2 != g {
+		t.Fatalf("new gap of %d packets returning to UDP", g2)
+	}
+	t.Logf("%d distinct packets, longest gap %d (the cut)", n, g)
+	pcancel()
+}

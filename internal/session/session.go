@@ -22,6 +22,7 @@ const (
 	kindControl byte = 0x20 // chat and notices, JSON lines both ways
 	kindListen  byte = 0x21 // engineer's monitor mix, engineer to client
 	kindReturn  byte = 0x22 // parked for the engineer to send prints back
+	kindPerform byte = 0x23 // the musician's live audio, client to engineer
 )
 
 // Event is a status message for the app (one JSON line in -events mode).
@@ -59,6 +60,9 @@ type Host struct {
 	Takes   *xfer.Receiver // stems and takes from the client
 	Monitor *Monitor       // live listen source; nil disables listening
 	UDP     *UDPMux        // listen audio over UDP when clients can reach it; nil: TCP only
+	// Perform opens where the musician's live audio plays (Opus packets,
+	// one per Write). Nil refuses it.
+	Perform func(StreamFormat) (io.WriteCloser, error)
 	Events  func(Event)
 	Name    string
 
@@ -147,6 +151,15 @@ func (h *Host) dispatch(ctx context.Context, c net.Conn) {
 		}
 		if err := h.Monitor.Stream(ctx, c, h.UDP); err != nil && ctx.Err() == nil {
 			h.emit(Event{"type": "log", "text": "listen stream ended: " + err.Error()})
+		}
+	case kindPerform:
+		defer c.Close()
+		stop := context.AfterFunc(ctx, func() { c.Close() })
+		defer stop()
+		if err := h.perform(ctx, pc); err != nil && ctx.Err() == nil {
+			h.emit(Event{"type": "perform", "state": "stopped", "error": err.Error()})
+		} else {
+			h.emit(Event{"type": "perform", "state": "stopped"})
 		}
 	case kindReturn:
 		select {
