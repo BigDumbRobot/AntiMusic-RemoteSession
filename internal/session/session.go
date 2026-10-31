@@ -156,7 +156,7 @@ func (h *Host) dispatch(ctx context.Context, c net.Conn) {
 		defer c.Close()
 		stop := context.AfterFunc(ctx, func() { c.Close() })
 		defer stop()
-		if err := h.perform(ctx, pc); err != nil && ctx.Err() == nil {
+		if err := h.perform(ctx, pc); err != nil && ctx.Err() == nil && !errors.Is(err, io.EOF) {
 			h.emit(Event{"type": "perform", "state": "stopped", "error": err.Error()})
 		} else {
 			h.emit(Event{"type": "perform", "state": "stopped"})

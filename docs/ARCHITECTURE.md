@@ -409,8 +409,11 @@ does the audio work on both ends and Go only moves packets:
   - Underruns and late packets raise the target by 10 ms (up to 300); 30
     quiet seconds lower it by 5 (down to 20). Plain loss does not raise it,
     since more buffer would not help.
-  - The decoder thread runs at user-interactive priority; at default
-    priority it was measured missing a 12 ms refill under load.
+  - The decoder thread is scheduled like an audio thread (Mach
+    time-constraint policy, 5 ms period, 1 ms budget; it sleeps between
+    packets). At default priority it missed a 12 ms refill under load, and
+    at user-interactive QoS it still underran with a remote-desktop app
+    using 90 % of a core. Real-time scheduling removed both.
 - Wire: `[u32 length][u32 sequence][Opus]`, a hello packet with the
   format first. The listen header says `"format":"opus"`. Without the
   helper the studio still sends `s24le`, and clients play both.
@@ -428,9 +431,6 @@ tone in every 20 ms of what was played:
 
 A local session (studio and client as two processes, Audio Bridge 2-B
 captured, default output played) ran with 0 underruns at a 40 ms target.
-
-Not done yet: the reverse direction (the engineer hearing the musician
-live).
 
 ### 13. Listen audio goes by UDP when it can, TCP otherwise
 
@@ -467,6 +467,41 @@ source through a UDP proxy that can drop either direction:
 Two processes on one Mac (through the LAN address) switched to UDP within
 the first second, with 0 underruns.
 
+### 14. The engineer hears the musician live
+
+The take still travels losslessly as a file; this is so the engineer can
+hear and direct the performance as it happens.
+
+- **Source:** the client picks an input device (captured by `rs-capture`)
+  or a Link plugin track. Link rings allow any number of readers, so the
+  recorder and the live stream read the same track. The plugin only runs
+  while the DAW processes the track (armed or playing), so the stream
+  pauses when it does and the player rebuffers.
+- **Connection:** a client-dialled perform connection (kind 0x23). The
+  studio answers with an optional UDP offer. The client sends the Opus
+  hello and packets by UDP to the studio's port, which is already
+  reachable for listening, and on TCP until the studio's acks (every
+  500 ms) confirm UDP arrives. While confirmed, TCP only carries a
+  keepalive every 2 s; when the acks say UDP stopped, TCP carries the
+  audio again.
+- Studio-side datagrams are accepted out of order within a 64-packet
+  replay window.
+- **Studio output:** the studio plays through `rs-live` on a chosen output
+  (`-perform-out`, or the Studio tab picker; "off" refuses live audio). An
+  Audio Bridge output makes it an input in Pro Tools.
+
+Evidence (2026-10-30):
+
+- `TestPerformUDP` (a real-time source through the dropping proxy): no
+  gap switching to UDP, about 1.5 s on TCP when UDP is cut, then back on
+  UDP with no new gap.
+- Two processes on one Mac (Audio Bridge 2-A sent live, played on the
+  system output) switched to UDP within the first second, with 0
+  underruns at a 40 ms target.
+
+Not yet tested: between two real networks, and from a Link track in a
+running DAW.
+
 ## Blockers and risks
 
 1. **The Link AAX is unsigned.** It loads and is verified in the Pro Tools
@@ -483,7 +518,5 @@ the first second, with 0 underruns.
 
 ## Not started (by design, per the phase plan)
 
-- Live audio from the musician to the engineer: the rest of Phase 3
-  (sections 12 and 13 cover the engineer-to-client direction).
 - Session-aware cache: Phase 4.
 - Collaboration, authentication, UI: Phase 5.

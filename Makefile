@@ -36,9 +36,11 @@ native:
 	@mkdir -p bin
 	cp native/build/rs-render_artefacts/Release/rs-render bin/
 
+# One package at a time: the live and session tests run real-time audio
+# and a simulated network, which other packages' load would disturb.
 test:
 	go vet ./...
-	go test ./...
+	go test -p 1 ./...
 
 clean:
 	rm -rf bin native/build

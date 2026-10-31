@@ -86,6 +86,8 @@ bin/rsession record -link "Vox" -dir takes/take3
 bin/rsession receive -dir takes/received -import
 # Home (regular Pro Tools, tracks sent to Audio Bridge, timing via PTSL):
 bin/rsession record -device "Pro Tools Audio Bridge 2-A" -dir takes/home1 -ptsl -code 8RC4TK-8WX0K7-GDZCFA
+# Live audio from the musician: client adds -perform-link "Vox" (or -perform-device <input>);
+# engineer picks where it plays with -perform-out "Pro Tools Audio Bridge 2-A" (bin/rsession outputs lists them).
 # Attended session from the command line: engineer adds -listen-device "Pro Tools Audio Bridge 2-B";
 # client: bin/rsession join -code <code> -dir prints -listen   (type to chat)
 # If the link drops, recording carries on; finish or re-send any take with:

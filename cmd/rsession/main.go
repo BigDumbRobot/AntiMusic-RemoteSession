@@ -5,6 +5,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -41,6 +42,7 @@ const usage = `usage: rsession <command> [flags]
 
 commands:
   devices        list CoreAudio input devices
+  outputs        list CoreAudio output devices (for -listen-out and -perform-out)
   latency        measure an interface's round trip with a loopback cable and compare it with what the device reports
   record         record a lossless master, journaling DAW transport
   deliver        render placed BWF deliverables from a take and verify them
@@ -61,6 +63,10 @@ func main() {
 	switch cmd, args := os.Args[1], os.Args[2:]; cmd {
 	case "devices":
 		err = devices()
+	case "outputs":
+		cmd := exec.Command(live.FindHelper(), "outputs")
+		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+		err = cmd.Run()
 	case "latency":
 		err = latencyCmd(args)
 	case "record":
@@ -550,6 +556,8 @@ func receiveCmd(args []string) error {
 	events := fs.Bool("events", false, "status as JSON lines on stdout, commands as JSON lines on stdin (for the app)")
 	listenDev := fs.String("listen-device", "", `monitor mix source clients can listen to (e.g. "Pro Tools Audio Bridge 2-B")`)
 	listenCh := fs.String("listen-ch", "1,2", "device channels for left,right of the listen stream")
+	performOut := fs.String("perform-out", "", `where the musician's live audio plays: an output device (e.g. "Pro Tools Audio Bridge 2-A"), "" for the system output, "off" to refuse it`)
+	performCh := fs.String("perform-ch", "1,2", "output channels for left,right of the musician's live audio")
 	name := fs.String("name", "", "studio name shown to clients")
 	printsDir := fs.String("prints-dir", "", "where outgoing prints are bundled (default: beside -dir)")
 	fs.Parse(args)
@@ -635,7 +643,7 @@ func receiveCmd(args []string) error {
 		ln = l
 		fmt.Fprintf(os.Stderr, "\n    Pairing code:  %s   (through relay %s)\n\n    Give this to the musician. Takes go to %s\n\n", code, r, *dir)
 		emit(map[string]any{"type": "code", "code": code.String(), "reach": "relay", "detail": "through relay " + r})
-		return serveHost(ctx, ln, nil, rv, emit, *events, *listenDev, *listenCh, *name, *printsDir, *dir, *addr)
+		return serveHost(ctx, ln, nil, rv, emit, *events, *listenDev, *listenCh, *performOut, *performCh, *name, *printsDir, *dir, *addr)
 	}
 
 	// Direct: the musician connects straight to this machine.
@@ -724,15 +732,30 @@ func receiveCmd(args []string) error {
 		ev["detail"] = "using your port forward at " + pub.String()
 	}
 	emit(ev)
-	return serveHost(ctx, ln, mux, rv, emit, *events, *listenDev, *listenCh, *name, *printsDir, *dir, *addr)
+	return serveHost(ctx, ln, mux, rv, emit, *events, *listenDev, *listenCh, *performOut, *performCh, *name, *printsDir, *dir, *addr)
 }
 
 // serveHost runs the engineer's side of sessions on ln. In events mode it
 // also reads commands from stdin: {"cmd":"chat","text":..} and
-// {"cmd":"send_prints","files":[..]}.
+// {"cmd":"send_prints","files":[..]} and {"cmd":"perform_out","device":..,"ch":"1,2"}.
 func serveHost(ctx context.Context, ln net.Listener, udp *session.UDPMux, rv *xfer.Receiver, emit func(map[string]any), events bool,
-	listenDev, listenCh, name, printsDir, dir, ptslAddr string) error {
+	listenDev, listenCh, performOut, performCh, name, printsDir, dir, ptslAddr string) error {
 	host := &session.Host{Takes: rv, Name: name, UDP: udp, Events: func(e session.Event) { emit(map[string]any(e)) }}
+	// The musician's live audio plays where the engineer chose; the
+	// choice applies to the next stream.
+	var pmu sync.Mutex
+	pOut, pCh := performOut, performCh
+	host.Perform = func(f session.StreamFormat) (io.WriteCloser, error) {
+		pmu.Lock()
+		dev, chs := pOut, pCh
+		pmu.Unlock()
+		if dev == "off" {
+			return nil, errors.New("the engineer has turned live audio off")
+		}
+		var l, r int
+		fmt.Sscanf(chs, "%d,%d", &l, &r)
+		return playOpus(dev, [2]int{l, r}, "perform", func(e session.Event) { host.Events(e) })
+	}
 	if !events {
 		host.Events = func(e session.Event) {
 			switch e["type"] {
@@ -757,6 +780,13 @@ func serveHost(ctx context.Context, ln net.Listener, udp *session.UDPMux, rv *xf
 		switch c.Cmd {
 		case "chat":
 			host.Chat(c.Text)
+		case "perform_out":
+			pmu.Lock()
+			pOut = c.Device
+			if c.Ch != "" {
+				pCh = c.Ch
+			}
+			pmu.Unlock()
 		case "send_prints":
 			go func() {
 				start := int64(-1) // place prints by their Pro Tools timestamps
@@ -787,6 +817,11 @@ type command struct {
 	Text  string   `json:"text,omitempty"`
 	Files []string `json:"files,omitempty"`
 	On    bool     `json:"on,omitempty"`
+	// perform (client): source "dev:<uid>" or "link:<path or track>";
+	// perform_out (studio): device ("" system output, "off" refuses).
+	Source string `json:"source,omitempty"`
+	Device string `json:"device,omitempty"`
+	Ch     string `json:"ch,omitempty"`
 }
 
 // readCommands reads JSON commands from stdin, or plain chat lines when
@@ -819,6 +854,9 @@ func joinCmd(args []string) error {
 	addr := fs.String("ptsl-addr", ptsl.DefaultAddress, "PTSL address (with -import)")
 	listen := fs.Bool("listen", false, "start listening to the engineer's monitor mix right away")
 	listenOut := fs.String("listen-out", "", "output device for listening (default: the system output)")
+	performDev := fs.String("perform-device", "", "send this input device live to the engineer (name or UID)")
+	performLink := fs.String("perform-link", "", "send this Link plugin track live to the engineer (track name or .rslink path)")
+	performCh := fs.String("perform-ch", "1,2", "input channels for left,right of the live audio")
 	events := fs.Bool("events", false, "status as JSON lines on stdout, commands as JSON lines on stdin (for the app)")
 	fs.Parse(args)
 	if *code == "" || *dir == "" {
@@ -891,7 +929,7 @@ func joinCmd(args []string) error {
 			go func() {
 				err := g.Listen(lctx, func(f session.StreamFormat) (io.WriteCloser, error) {
 					if f.Format == "opus" {
-						return playOpus(*listenOut, emit)
+						return playOpus(*listenOut, [2]int{}, "listen", emit)
 					}
 					return playOut(f.Rate, f.Channels)
 				})
@@ -906,6 +944,40 @@ func joinCmd(args []string) error {
 	if *listen {
 		setListen(true)
 	}
+
+	// The musician's live audio to the engineer.
+	var pcancel context.CancelFunc
+	setPerform := func(on bool, source, chs string) {
+		lmu.Lock()
+		defer lmu.Unlock()
+		if pcancel != nil {
+			pcancel()
+			pcancel = nil
+		}
+		if !on {
+			emit(session.Event{"type": "perform", "state": "stopped"})
+			return
+		}
+		src, err := performSource(source, chs)
+		if err != nil {
+			emit(session.Event{"type": "perform", "state": "stopped", "error": err.Error()})
+			return
+		}
+		var pctx context.Context
+		pctx, pcancel = context.WithCancel(ctx)
+		go func() {
+			err := g.Perform(pctx, src)
+			if err != nil && pctx.Err() == nil {
+				emit(session.Event{"type": "perform", "state": "stopped", "error": err.Error()})
+			}
+		}()
+	}
+	switch {
+	case *performDev != "":
+		setPerform(true, "dev:"+*performDev, *performCh)
+	case *performLink != "":
+		setPerform(true, "link:"+*performLink, *performCh)
+	}
 	go readCommands(ctx, func(cm command) {
 		switch cm.Cmd {
 		case "chat":
@@ -914,6 +986,8 @@ func joinCmd(args []string) error {
 			}
 		case "listen":
 			setListen(cm.On)
+		case "perform":
+			setPerform(cm.On, cm.Source, cm.Ch)
 		case "send_stems":
 			go func() {
 				start := int64(-1)
@@ -951,16 +1025,16 @@ func liveHelper() string {
 
 // playOpus plays an Opus listen stream through rs-live (jitter buffer,
 // drift control, CoreAudio) and reports its buffer once a second.
-func playOpus(device string, emit func(session.Event)) (io.WriteCloser, error) {
+func playOpus(device string, ch [2]int, evType string, emit func(session.Event)) (io.WriteCloser, error) {
 	h := liveHelper()
 	if h == "" {
 		return nil, errors.New("rs-live is missing; reinstall RemoteSession")
 	}
-	p, err := live.StartPlayer(live.PlayerConfig{Helper: h, Device: device, OnStats: func(s live.Stats) {
+	p, err := live.StartPlayer(live.PlayerConfig{Helper: h, Device: device, Channels: ch, OnStats: func(s live.Stats) {
 		if s.Done || s.Received == 0 {
 			return
 		}
-		emit(session.Event{"type": "listen", "state": "playing", "buffer_ms": math.Round(s.TargetMs),
+		emit(session.Event{"type": evType, "state": "playing", "buffer_ms": math.Round(s.TargetMs),
 			"depth_ms": math.Round(s.DepthMs), "concealed": s.PLC, "late": s.Late, "underruns": s.Underruns,
 			"buffering": s.Buffering})
 	}})
@@ -1333,4 +1407,108 @@ func abs(x int) int {
 		return -x
 	}
 	return x
+}
+
+// performSource builds the musician's live audio source: "dev:<device>"
+// (captured with rs-capture) or "link:<track or path>" (a Link plugin).
+func performSource(source, chs string) (session.PacketSource, error) {
+	var l, r int
+	if chs == "" {
+		chs = "1,2"
+	}
+	if _, err := fmt.Sscanf(chs, "%d,%d", &l, &r); err != nil {
+		return nil, errors.New("channels: want two like 1,2")
+	}
+	h := liveHelper()
+	if h == "" {
+		return nil, errors.New("rs-live is missing; reinstall RemoteSession")
+	}
+	switch {
+	case strings.HasPrefix(source, "dev:"):
+		m := &session.Monitor{Device: strings.TrimPrefix(source, "dev:"), Channels: [2]int{l, r},
+			Capture: recorder.FindCaptureHelper(), Live: h}
+		return m.Packets, nil
+	case strings.HasPrefix(source, "link:"):
+		sel := strings.TrimPrefix(source, "link:")
+		return func(ctx context.Context) (live.Packet, <-chan []byte, error) {
+			return linkPackets(ctx, h, sel, l-1, r-1)
+		}, nil
+	}
+	return nil, fmt.Errorf("unknown live audio source %q", source)
+}
+
+// linkPackets encodes a Link plugin track's audio as it is published.
+// The plugin only runs while the DAW processes the track (armed, or
+// playing), so the stream pauses when it does.
+func linkPackets(ctx context.Context, helper, sel string, left, right int) (live.Packet, <-chan []byte, error) {
+	ring, err := openLink(sel)
+	if err != nil {
+		return nil, nil, err
+	}
+	if left < 0 || left >= ring.Channels {
+		left = 0
+	}
+	if right < 0 || right >= ring.Channels {
+		right = min(1, ring.Channels-1)
+	}
+	enc, err := live.StartEncoder(live.EncoderConfig{Helper: helper, Rate: int(ring.SampleRate), Channels: 2})
+	if err != nil {
+		ring.Close()
+		return nil, nil, err
+	}
+	hello, err := enc.Next()
+	if err != nil {
+		enc.Close()
+		ring.Close()
+		return nil, nil, err
+	}
+	out := make(chan []byte, 50)
+	go func() { // packets out; a slow network drops the oldest
+		defer close(out)
+		for {
+			p, err := enc.Next()
+			if err != nil {
+				return
+			}
+			select {
+			case out <- p:
+			default:
+				select {
+				case <-out:
+				default:
+				}
+				out <- p
+			}
+		}
+	}()
+	go func() { // audio in
+		defer ring.Close()
+		defer enc.Close()
+		rd := ring.NewReader(true)
+		ch := ring.Channels
+		buf := make([]byte, 0, 8192)
+		t := time.NewTicker(3 * time.Millisecond)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
+			blocks, _ := rd.Read()
+			buf = buf[:0]
+			for _, b := range blocks {
+				for f := 0; f < int(b.Frames); f++ {
+					buf = binary.LittleEndian.AppendUint32(buf, math.Float32bits(b.Audio[f*ch+left]))
+					buf = binary.LittleEndian.AppendUint32(buf, math.Float32bits(b.Audio[f*ch+right]))
+				}
+			}
+			if len(buf) > 0 {
+				if _, err := enc.In.Write(buf); err != nil {
+					return
+				}
+			}
+		}
+	}()
+	return hello, out, nil
 }

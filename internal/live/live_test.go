@@ -61,6 +61,7 @@ type network struct {
 	stallAt   time.Duration // packets due in [stallAt, stallAt+stall) are held until its end
 	stall     time.Duration
 	loss      float64 // probability a packet never arrives (UDP)
+	targetMs  int     // player's starting target (default 40)
 	reorder   bool    // packets may overtake each other (UDP)
 	frameTime time.Duration
 }
@@ -147,7 +148,11 @@ func runFor(t *testing.T, name string, seconds, ppm float64, n network) (Stats, 
 	}
 	dump := filepath.Join(t.TempDir(), name+".f32")
 	var stats []Stats
-	p, err := StartPlayer(PlayerConfig{Helper: h, Null: true, NullPPM: ppm, Dump: dump, TargetMs: 40, MinMs: 20,
+	target := n.targetMs
+	if target == 0 {
+		target = 40
+	}
+	p, err := StartPlayer(PlayerConfig{Helper: h, Null: true, NullPPM: ppm, Dump: dump, TargetMs: target, MinMs: 20,
 		OnStats: func(s Stats) { stats = append(stats, s) }})
 	if err != nil {
 		t.Fatal(err)
@@ -199,11 +204,18 @@ func lowWindows(lv []float64) int {
 	return low
 }
 
+// Timing tests: run on a quiet machine (make test runs packages one at a
+// time); the simulated network is goroutines with sleeps, and heavy load
+// makes it deliver late.
+//
 // A clean in-order network with a receiving clock 200 ppm fast (two
 // crystals rarely differ by more than about 100): no losses, no
 // concealment, the resampler takes up the drift.
 func TestPlayDriftAndJitter(t *testing.T) {
-	s, lv := runFor(t, "drift", 30, 200, network{jitter: 15 * time.Millisecond})
+	// 60 ms: the 20 ms output ring plus room for 15 ms of jitter and 10 ms
+	// packet steps. (At 40 a late packet can raise the target, which is
+	// the adaptive behaviour the other tests cover, not drift.)
+	s, lv := runFor(t, "drift", 30, 200, network{jitter: 15 * time.Millisecond, targetMs: 60})
 	if s.Underruns != 0 || s.PLC != 0 || s.Skipped != 0 || s.Late != 0 {
 		t.Errorf("clean network: %+v", s)
 	}

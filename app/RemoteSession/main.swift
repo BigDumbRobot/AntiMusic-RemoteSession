@@ -35,6 +35,13 @@ enum Tool {
         return String(decoding: data, as: UTF8.self)
     }
 
+    static func outputs() -> [(name: String, uid: String)] {
+        Tool.output(["outputs"]).split(separator: "\n").compactMap { line in
+            guard let o = parse(String(line)), let name = o["name"] as? String, let uid = o["uid"] as? String else { return nil }
+            return (name, uid)
+        }
+    }
+
     static func devices() -> [(name: String, uid: String)] {
         Tool.output(["devices"]).split(separator: "\n").compactMap { line in
             guard let d = line.data(using: .utf8),
@@ -162,6 +169,16 @@ final class Studio: ObservableObject {
     @Published var importIntoProTools = true {
         didSet { if oldValue != importIntoProTools { restart() } }
     }
+    // Where the musician's live audio plays: "" system output, "off", or a device.
+    @Published var outputs: [(name: String, uid: String)] = []
+    @Published var performOut: String = UserDefaults.standard.string(forKey: "performOut") ?? "" {
+        didSet {
+            UserDefaults.standard.set(performOut, forKey: "performOut")
+            job?.send(["cmd": "perform_out", "device": performOut])
+        }
+    }
+    @Published var performInfo = ""
+    private var performPath = ""
     @Published var timerRunning = false
     @Published var elapsed: TimeInterval = 0
     private var timerStart: Date?
@@ -174,11 +191,13 @@ final class Studio: ObservableObject {
         guard job == nil else { return }
         problem = nil
         if devices.isEmpty { devices = Tool.devices() }
+        if outputs.isEmpty { outputs = Tool.outputs() }
         if listenDevice.isEmpty, let b = devices.first(where: { $0.name.contains("Audio Bridge 2") }) { listenDevice = b.name }
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         var args = ["receive", "-events", "-deliver", "-dir", folder.path, "-name", Host.current().localizedName ?? "Studio"]
         if importIntoProTools { args.append("-import") }
         if !listenDevice.isEmpty { args += ["-listen-device", listenDevice] }
+        if !performOut.isEmpty { args += ["-perform-out", performOut] }
         job = Job(args, stdout: { [weak self] in self?.event($0) },
                   stderr: { [weak self] l in if l.hasPrefix("rsession: ") { self?.lastError = String(l.dropFirst(10)) } },
                   exit: { [weak self] status, stopped in
@@ -248,6 +267,21 @@ final class Studio: ObservableObject {
             client = (ev["connected"] as? Bool ?? false) ? (ev["name"] as? String ?? "Client") : nil
         case "chat":
             chat.append(ChatLine(mine: (ev["from"] as? String) == "engineer", text: ev["text"] as? String ?? ""))
+        case "perform":
+            if let p = ev["path"] as? String { performPath = p }
+            switch ev["state"] as? String {
+            case "playing":
+                if let ms = ev["buffer_ms"] as? Double {
+                    var info = "Hearing \(client ?? "the musician") live · \(Int(ms)) ms buffer"
+                    if performPath == "udp" { info += " · direct (UDP)" } else if performPath == "tcp" { info += " · TCP" }
+                    performInfo = info
+                } else if performInfo.isEmpty {
+                    performInfo = "Hearing \(client ?? "the musician") live"
+                }
+            default:
+                performPath = ""
+                performInfo = (ev["error"] as? String).map { "Live audio stopped: " + $0 } ?? ""
+            }
         case "prints":
             switch ev["state"] as? String {
             case "sending": printsStatus = "Sending prints…"
@@ -288,6 +322,7 @@ struct Source: Identifiable, Hashable {
     let id: String
     let label: String
     let args: [String]
+    let perform: String // live audio source for rsession join ("link:…" or "dev:…")
 }
 
 final class Client: ObservableObject {
@@ -307,6 +342,8 @@ final class Client: ObservableObject {
     @Published var source: Source?
     @Published var recording = false
     @Published var recordStatus = ""
+    @Published var performing = false
+    @Published var performInfo = ""
     private var job: Job?
     private var rec: Job?
     private var lastError = ""
@@ -333,6 +370,8 @@ final class Client: ObservableObject {
                       self.joined = false
                       self.studio = nil
                       self.listening = false
+                      self.performing = false
+                      self.performInfo = ""
                       if !stopped { self.status = self.lastError.isEmpty ? "Disconnected." : self.lastError }
                   })
         joined = job != nil
@@ -345,7 +384,16 @@ final class Client: ObservableObject {
         joined = false
         studio = nil
         listening = false
+        performing = false
+        performInfo = ""
         status = "Left the session."
+    }
+
+    func setPerforming(_ on: Bool) {
+        guard let source, job != nil else { return }
+        performing = on
+        performInfo = on ? "Starting…" : ""
+        job?.send(["cmd": "perform", "on": on, "source": source.perform])
     }
 
     func setListening(_ on: Bool) {
@@ -392,6 +440,18 @@ final class Client: ObservableObject {
                 listenInfo = info
             }
             if let e = ev["error"] as? String, !e.isEmpty { status = "Listen: " + e }
+        case "perform":
+            switch ev["state"] as? String {
+            case "sending":
+                if let p = ev["path"] as? String {
+                    performInfo = "The studio hears you live · " + (p == "udp" ? "direct (UDP)" : "TCP")
+                }
+            case "reconnecting":
+                performInfo = "Reconnecting live audio…"
+            default:
+                performing = false
+                performInfo = (ev["error"] as? String).map { "Live audio stopped: " + $0 } ?? ""
+            }
         case "stems":
             switch ev["state"] as? String {
             case "sending": stemsStatus = "Sending stems…"
@@ -423,10 +483,10 @@ final class Client: ObservableObject {
             let f = line.split(separator: "\t").map(String.init)
             guard f.count >= 6, f[0] == "active" else { continue }
             let track = f[1].trimmingCharacters(in: CharacterSet(charactersIn: "\""))
-            list.append(Source(id: "link:" + f[5], label: "Track \"\(track)\" in \(f[2]) (Link plugin)", args: ["-link", f[5]]))
+            list.append(Source(id: "link:" + f[5], label: "Track \"\(track)\" in \(f[2]) (Link plugin)", args: ["-link", f[5]], perform: "link:" + f[5]))
         }
         for d in Tool.devices() {
-            list.append(Source(id: "dev:" + d.uid, label: "\(d.name) (Pro Tools transport)", args: ["-device", d.uid, "-ptsl"]))
+            list.append(Source(id: "dev:" + d.uid, label: "\(d.name) (Pro Tools transport)", args: ["-device", d.uid, "-ptsl"], perform: "dev:" + d.uid))
         }
         sources = list
         if source == nil || !list.contains(where: { $0 == source }) {
@@ -849,6 +909,16 @@ struct StudioView: View {
                     Button { studio.sendPrints() } label: { Label("Send prints", systemImage: "paperplane.fill") }
                         .buttonStyle(NeonButton(color: Neon.pink, filled: true)).disabled(studio.client == nil)
                 }
+                HStack {
+                    GlowText(text: "Musician plays through:", color: Neon.ice.opacity(0.8), size: 12)
+                    Picker("", selection: $studio.performOut) {
+                        Text("System output").tag("")
+                        ForEach(studio.outputs, id: \.uid) { d in Text(d.name).tag(d.name) }
+                        Text("Off (don't play live audio)").tag("off")
+                    }.labelsHidden().frame(maxWidth: 280)
+                    Spacer()
+                }
+                if !studio.performInfo.isEmpty { GlowText(text: studio.performInfo, color: Neon.dim, size: 11) }
                 if !studio.printsStatus.isEmpty { GlowText(text: studio.printsStatus, color: Neon.yellow, size: 12) }
                 ChatBox(lines: studio.chat, enabled: studio.client != nil) { studio.say($0) }
             }
@@ -964,6 +1034,13 @@ struct JoinView: View {
                             .disabled(!client.codeLooksValid || client.source == nil)
                     }
                 }
+                HStack {
+                    Toggle("Let the studio hear me live", isOn: Binding(get: { client.performing }, set: { client.setPerforming($0) }))
+                        .toggleStyle(.switch).tint(Neon.purple).foregroundColor(Neon.ice)
+                        .disabled(!client.joined || client.source == nil)
+                    Spacer()
+                }
+                if !client.performInfo.isEmpty { GlowText(text: client.performInfo, color: Neon.dim, size: 11) }
                 GlowText(text: client.recordStatus.isEmpty
                          ? "Any DAW: put the RemoteSession Link plugin on a track. Pro Tools can also use Audio Bridge."
                          : client.recordStatus, color: client.recordStatus.isEmpty ? Neon.dim : Neon.yellow, size: 11)

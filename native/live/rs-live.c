@@ -344,16 +344,23 @@ static void *reader(void *arg) {
 // writing what it plays to dump.
 static double null_ppm;
 static FILE *dump;
-static void *null_clock(void *arg) {
-    (void)arg;
-    // Real-time scheduling, as CoreAudio gives an IOProc thread, so the
-    // simulated device keeps time like a real one.
+// make_realtime gives the calling thread time-constraint scheduling, as
+// CoreAudio gives its IO threads: period and constraint in ms, with a
+// computation budget of 1 ms.
+static void make_realtime(double period_ms) {
     mach_timebase_info_data_t tb;
     mach_timebase_info(&tb);
     double per_ms = 1e6 * tb.denom / tb.numer;
-    thread_time_constraint_policy_data_t pol = {(uint32_t)(5.3 * per_ms), (uint32_t)(1 * per_ms), (uint32_t)(5.3 * per_ms), 1};
+    thread_time_constraint_policy_data_t pol = {(uint32_t)(period_ms * per_ms), (uint32_t)(1 * per_ms),
+                                                (uint32_t)(period_ms * per_ms), 1};
     thread_policy_set(pthread_mach_thread_np(pthread_self()), THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&pol,
                       THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+}
+
+static void *null_clock(void *arg) {
+    (void)arg;
+    // So the simulated device keeps time like a real one.
+    make_realtime(5.3);
     const size_t chunk = 256;
     float buf[256 * 2];
     double rate = P.out_rate * (1 + null_ppm / 1e6);
@@ -496,9 +503,12 @@ static int cmd_play(int argc, char **argv) {
 
     pthread_t rt, nt;
     pthread_create(&rt, NULL, reader, NULL);
-    // The decoder must refill the ring within a few milliseconds; at
-    // default priority it was measured missing 20 ms under load.
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    // The decoder must refill the ring within a few milliseconds. At
+    // default priority it was measured missing 20 ms under load, and at
+    // user-interactive QoS still missing it with a remote-desktop app
+    // busy, so it is scheduled like an audio thread. It does well under
+    // 1 ms of work per 10 ms packet and sleeps between.
+    make_realtime(5);
 
     // Ring kept just deep enough for the device: what the decoder tops up
     // to on every pass. The jitter buffer proper is the packet queue.
@@ -680,10 +690,61 @@ static int cmd_play(int argc, char **argv) {
     return 0;
 }
 
+// cmd_outputs lists output devices as JSON lines (name, uid, outputs,
+// rate), the default output first.
+static int cmd_outputs(void) {
+    AudioObjectID def = find_output(NULL);
+    AudioObjectPropertyAddress a = {kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+    UInt32 size = 0;
+    AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &a, 0, NULL, &size);
+    AudioObjectID ids[256];
+    if (size > sizeof ids) size = sizeof ids;
+    AudioObjectGetPropertyData(kAudioObjectSystemObject, &a, 0, NULL, &size, ids);
+    for (int pass = 0; pass < 2; pass++) {
+        for (UInt32 i = 0; i < size / sizeof(AudioObjectID); i++) {
+            if ((pass == 0) != (ids[i] == def)) continue;
+            int n = output_channels(ids[i]);
+            if (n <= 0) continue;
+            char name[256] = "", uid[256] = "";
+            CFStringRef s = NULL;
+            UInt32 z = sizeof s;
+            AudioObjectPropertyAddress na = {kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+            if (AudioObjectGetPropertyData(ids[i], &na, 0, NULL, &z, &s) == noErr && s) {
+                CFStringGetCString(s, name, sizeof name, kCFStringEncodingUTF8);
+                CFRelease(s);
+            }
+            na.mSelector = kAudioDevicePropertyDeviceUID;
+            z = sizeof s;
+            if (AudioObjectGetPropertyData(ids[i], &na, 0, NULL, &z, &s) == noErr && s) {
+                CFStringGetCString(s, uid, sizeof uid, kCFStringEncodingUTF8);
+                CFRelease(s);
+            }
+            AudioObjectPropertyAddress ra = {kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+            Float64 r = 0;
+            z = sizeof r;
+            AudioObjectGetPropertyData(ids[i], &ra, 0, NULL, &z, &r);
+            printf("{\"name\":\"");
+            for (char *c = name; *c; c++) {
+                if (*c == '"' || *c == '\\') putchar('\\');
+                putchar(*c);
+            }
+            printf("\",\"uid\":\"");
+            for (char *c = uid; *c; c++) {
+                if (*c == '"' || *c == '\\') putchar('\\');
+                putchar(*c);
+            }
+            printf("\",\"outputs\":%d,\"rate\":%.0f,\"default\":%s}\n", n, r, pass == 0 ? "true" : "false");
+        }
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
+    if (argc >= 2 && !strcmp(argv[1], "outputs")) return cmd_outputs();
     if (argc >= 2 && !strcmp(argv[1], "encode")) return cmd_encode(argc - 2, argv + 2);
     if (argc >= 2 && !strcmp(argv[1], "play")) return cmd_play(argc - 2, argv + 2);
     fprintf(stderr, "usage: rs-live encode --rate R [--channels 2] [--frame 480] [--bitrate 256000]\n"
+                    "       rs-live outputs\n"
                     "       rs-live play [--device NAME|UID] [--ch L,R] [--target-ms 40] [--min-ms 20] [--null PPM] [--dump FILE]\n");
     return 2;
 }
