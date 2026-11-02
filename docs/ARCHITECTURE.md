@@ -9,9 +9,9 @@ decision cites a measurement made on the development machine. Statements marked
 | Item | Found |
 |---|---|
 | OS | macOS 26.1 (25B78), Apple Silicon (arm64) |
-| DAW | Pro Tools 26.4.0 build 175 ("2026.4"), Intel binary running under Rosetta |
+| DAW | Pro Tools 26.4.0 build 175 ("2026.4") was tested under Rosetta; the local Pro Tools Developer app runs native arm64. |
 | DAW scripting | PTSL, gRPC on `localhost:31416`; the schema is embedded in `Pro Tools.app/Contents/Frameworks/libPTSL.dylib` (proto3, self-contained). The PTSL C++ SDK zip in Dropbox is a 0-byte online-only placeholder. |
-| Plugin SDKs | JUCE 8.0.10 (as used by Anti-Music's Panner) bundles the AAX SDK. No PACE signing tools and no Pro Tools Developer build. |
+| Plugin SDKs | JUCE 8.0.10 (as used by Anti-Music's Panner) bundles the AAX SDK. No PACE signing tools; the local Pro Tools Developer app runs native arm64. |
 | FFmpeg | 9.0.1 (Homebrew): `avfoundation` input, `audiotoolbox` output, WAV muxer with `write_bext` and `rf64`, CAF muxer |
 | Toolchain | Go 1.25, Apple clang 21, Swift, CMake, Python 3.14 |
 | Audio devices | Pro Tools Audio Bridge 2-A/2-B/6/16/32/64, VB-Cable (8 ch, 44.1 kHz), built-in microphone and others |
@@ -221,9 +221,10 @@ in Pro Tools.
 
 ## Blockers and risks
 
-1. **The Link AAX is built but unsigned.** Retail Pro Tools does not load
-   unsigned AAX plugins. Needed from the owner: PACE signing tools and an iLok
-   developer account, or a Pro Tools Developer build. Once it loads, verify:
+1. **The Link AAX is unsigned.** It is installed in the system AAX plugin
+   folder, but Pro Tools was already running during installation; restart it
+   and confirm the insert is listed and loads. Retail Pro Tools requires AAX
+   signing with PACE tools and an iLok developer account. Once it loads, verify:
    - position semantics under delay compensation;
    - behaviour while stopped;
    - track-name reporting.

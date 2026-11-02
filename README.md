@@ -27,7 +27,17 @@ make test     # unit and end-to-end tests (needs ffmpeg; PTSL schema tests need 
 ```
 
 Plugin builds land in `native/build/RemoteSessionLink_artefacts/Release/`.
-The AAX build is unsigned (see the blockers in the architecture doc).
+The AAX build is universal and unsigned. To install it for Pro Tools Developer:
+
+```sh
+ditto "native/build/RemoteSessionLink_artefacts/Release/AAX/RemoteSession Link.aaxplugin" \
+  "/Library/Application Support/Avid/Audio/Plug-Ins/RemoteSession Link.aaxplugin"
+```
+
+Restart Pro Tools Developer after installation, then add **RemoteSession Link**
+as an insert on the track to capture. The plugin is a pass-through and has no
+editor window. Retail Pro Tools requires AAX signing; see the blockers in the
+architecture doc.
 
 ## Use
 

@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.22)
 
 set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Minimum macOS version")
+if(APPLE)
+    set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING
+        "Build plugins for Apple Silicon and Intel Pro Tools")
+endif()
 
 project(RemoteSessionNative VERSION 0.1.0 LANGUAGES C CXX)
 
